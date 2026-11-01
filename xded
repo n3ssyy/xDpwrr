@@ -1,0 +1,1174 @@
+-- xDpwr v2 | ESP, Visuals, Universal, Antishki
+-- RightShift или кнопка с лого: скрыть / показать меню
+
+local Players = game:GetService("Players")
+local RS = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+-- если скрипт запущен повторно, убираем старую копию
+if getgenv and getgenv().xDpwr then pcall(getgenv().xDpwr) end
+
+---------------------------------------------------------------- состояние
+local S = {
+	-- esp
+	esp = false, skeleton = true, box = false, name = true, dist = true, health = true,
+	tracers = false, chams = false, chamsFill = 0.7,
+	team = false, nonPlayers = true, maxDist = 2000, thick = 1.5,
+	espColor = {255, 255, 255},
+	-- visuals: камера
+	fovOn = false, fov = 90, stretch = false, stretchAmt = 0.75,
+	-- visuals: мир
+	fullbright = false, noFog = false, timeOn = false, clock = 14,
+	tintOn = false, tint = {120, 160, 255},
+	ccOn = false, sat = 0, contrast = 0, bright = 0,
+	bloom = false, bloomInt = 0.6,
+	snow = false, snowAmt = 1, snowWind = 2,
+	-- visuals: прицел
+	cross = false, crossSize = 8, crossGap = 4, crossThick = 2, crossDot = false,
+	crossColor = {255, 255, 255},
+	-- universal
+	bhop = false, bhopSpeed = 21,
+	bhopStrafe = false, strafeSpeed = 29,
+	fixed = false, fixedSpeed = 21,
+	-- antishki
+	yawMode = 1, spinSpeed = 25, jitAngle = 60,
+	pitchMode = 1, pitchAngle = 80,
+	-- меню
+	accent = {110, 90, 255},
+	winAlpha = 0,
+}
+
+local function C(t) return Color3.fromRGB(t[1], t[2], t[3]) end
+local function A() return C(S.accent) end
+local function shade(c, f) return Color3.new(c.R * f, c.G * f, c.B * f) end
+
+local BG, SIDE = Color3.fromRGB(14, 14, 19), Color3.fromRGB(10, 10, 14)
+local EL, EL2, LINE = Color3.fromRGB(21, 21, 28), Color3.fromRGB(34, 34, 45), Color3.fromRGB(48, 48, 62)
+local TXT, DIM = Color3.fromRGB(226, 228, 240), Color3.fromRGB(128, 132, 150)
+
+local conns = {}
+local function bind(sig, fn)
+	local c = sig:Connect(fn)
+	conns[#conns + 1] = c
+	return c
+end
+
+local accentFns = {}
+local function onAccent(fn)
+	accentFns[#accentFns + 1] = fn
+	fn()
+end
+local function applyAccent()
+	for _, fn in ipairs(accentFns) do fn() end
+end
+
+local lastErr = nil
+local function safe(tag, fn)
+	return function(...)
+		local ok, e = pcall(fn, ...)
+		if not ok then lastErr = tag .. ": " .. tostring(e) end
+	end
+end
+
+local statusLbl, uniLbl = nil, nil -- заполняются при создании меню
+
+---------------------------------------------------------------- ESP: поиск целей
+-- Drawing есть не у всех инжекторов, поэтому проверяем безопасно
+local hasDrawing = pcall(function()
+	local l = Drawing.new("Line")
+	l:Remove()
+end)
+
+-- R15 и R6 в одном списке: отсутствующих частей просто нет, линия скрывается
+local bones = {
+	{"Head", "UpperTorso"}, {"UpperTorso", "LowerTorso"},
+	{"UpperTorso", "LeftUpperArm"}, {"LeftUpperArm", "LeftHand"},
+	{"UpperTorso", "RightUpperArm"}, {"RightUpperArm", "RightHand"},
+	{"LowerTorso", "LeftUpperLeg"}, {"LeftUpperLeg", "LeftFoot"},
+	{"LowerTorso", "RightUpperLeg"}, {"RightUpperLeg", "RightFoot"},
+	{"Head", "Torso"}, {"Torso", "Left Arm"}, {"Torso", "Right Arm"},
+	{"Torso", "Left Leg"}, {"Torso", "Right Leg"},
+}
+
+-- Во многих играх (в т.ч. шутерах) персонажи лежат не в Player.Character,
+-- а в папках workspace. Поэтому, кроме игроков, ловим любые модели с Humanoid.
+local extra = {}
+
+local function consider(inst)
+	local m = nil
+	if inst:IsA("Humanoid") then
+		m = inst.Parent
+	elseif inst:IsA("Model") and Players:FindFirstChild(inst.Name) then
+		m = inst
+	end
+	if m and m:IsA("Model") and m ~= workspace and m.Name ~= lp.Name then
+		extra[m] = true
+	end
+end
+
+task.spawn(function()
+	local n = 0
+	for _, d in ipairs(workspace:GetDescendants()) do
+		consider(d)
+		n = n + 1
+		if n % 3000 == 0 then task.wait() end
+	end
+end)
+bind(workspace.DescendantAdded, consider)
+bind(workspace.DescendantRemoving, function(d)
+	extra[d] = nil
+	if d:IsA("Humanoid") and d.Parent then extra[d.Parent] = nil end
+end)
+
+local function collect()
+	local out, seen, n = {}, {}, 0
+	local own = lp.Character
+	for _, p in ipairs(Players:GetPlayers()) do
+		local ch = p.Character
+		if p ~= lp and ch and ch ~= own and not seen[ch] then
+			seen[ch] = true
+			n = n + 1
+			out[n] = {m = ch, p = p}
+		end
+	end
+	if S.nonPlayers then
+		for m in pairs(extra) do
+			if not seen[m] and m ~= own and m.Parent then
+				seen[m] = true
+				n = n + 1
+				out[n] = {m = m, p = Players:GetPlayerFromCharacter(m)}
+			end
+		end
+	end
+	return out
+end
+
+---------------------------------------------------------------- ESP: команды и здоровье
+local function readTeam(inst)
+	if not inst then return nil end
+	local a = inst:GetAttribute("Team")
+	if a == nil then a = inst:GetAttribute("TeamName") end
+	if a ~= nil then return a end
+	local v = inst:FindFirstChild("Team")
+	if v and v:IsA("ValueBase") then return v.Value end
+	return nil
+end
+
+local function teamOf(m, p)
+	if p and p.Team then return p.Team end
+	local r = readTeam(p)
+	if r == nil then r = readTeam(m) end
+	return r
+end
+
+-- объект Team и строка-атрибут сравниваем по имени команды
+local function teamKey(v)
+	if typeof(v) == "Instance" then return v.Name end
+	return v
+end
+
+-- если команду определить нельзя, считаем игрока врагом (лучше лишний, чем пропущенный)
+local function sameTeam(m, p)
+	local mine = teamKey(teamOf(lp.Character, lp))
+	local theirs = teamKey(teamOf(m, p))
+	if mine == nil or theirs == nil then return false end
+	return mine == theirs
+end
+
+local function healthOf(m, hum)
+	if hum then return hum.Health, hum.MaxHealth end
+	local h = m:GetAttribute("Health")
+	if type(h) ~= "number" then return nil, nil end
+	local mh = m:GetAttribute("MaxHealth")
+	if type(mh) ~= "number" or mh <= 0 then mh = 100 end
+	return h, mh
+end
+
+---------------------------------------------------------------- ESP: объекты рисования
+local objs, hlSet = {}, {}
+local hlCount = 0
+
+local function newObj()
+	local d = {bones = {}}
+	for i = 1, #bones do
+		local l = Drawing.new("Line")
+		l.Visible = false
+		d.bones[i] = l
+	end
+	d.box = Drawing.new("Square")
+	d.box.Filled = false
+	d.box.Visible = false
+	d.tracer = Drawing.new("Line")
+	d.tracer.Visible = false
+	d.hp = Drawing.new("Line")
+	d.hp.Visible = false
+	d.name = Drawing.new("Text")
+	d.dist = Drawing.new("Text")
+	for _, t in ipairs({d.name, d.dist}) do
+		t.Center, t.Outline, t.Size, t.Visible = true, true, 13, false
+	end
+	return d
+end
+
+local function hideObj(d)
+	for _, l in ipairs(d.bones) do l.Visible = false end
+	d.box.Visible = false
+	d.tracer.Visible = false
+	d.hp.Visible = false
+	d.name.Visible = false
+	d.dist.Visible = false
+end
+
+local function removeObj(m)
+	local d = objs[m]
+	if not d then return end
+	for _, l in ipairs(d.bones) do pcall(function() l:Remove() end) end
+	for _, k in ipairs({"box", "tracer", "hp", "name", "dist"}) do
+		pcall(function() d[k]:Remove() end)
+	end
+	objs[m] = nil
+end
+
+-- chams: контур + заливка через Highlight (работает и без Drawing)
+local function setHL(m, on, col)
+	local h = m:FindFirstChild("xD_hl")
+	if on then
+		if not h then
+			h = Instance.new("Highlight")
+			h.Name = "xD_hl"
+			h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			h.Parent = m
+			hlSet[m] = true
+		end
+		h.FillColor, h.OutlineColor = col, col
+		h.FillTransparency, h.OutlineTransparency = S.chamsFill, 0
+	elseif h then
+		h:Destroy()
+		hlSet[m] = nil
+	end
+end
+
+local function drawTarget(t, col, camPos, vp)
+	local m, p = t.m, t.p
+	local hum = m:FindFirstChildOfClass("Humanoid")
+	local root = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart or m:FindFirstChild("Torso")
+		or m:FindFirstChild("UpperTorso") or m:FindFirstChildWhichIsA("BasePart")
+	if not root then return false end
+	local head = m:FindFirstChild("Head") or root
+	local hp, mhp = healthOf(m, hum)
+	if hp and hp <= 0 then return false end
+	local dist = (root.Position - camPos).Magnitude
+	if dist > S.maxDist then return false end
+	if S.team and sameTeam(m, p) then return false end
+
+	-- без Drawing chams включаются сами, иначе ESP вообще ничего не покажет
+	if S.chams or not hasDrawing then
+		if hlCount < 30 then
+			hlCount = hlCount + 1
+			setHL(m, true, col)
+		end
+	else
+		setHL(m, false)
+	end
+	if not hasDrawing then return true end
+
+	local d = objs[m]
+	if not d then
+		d = newObj()
+		objs[m] = d
+	end
+
+	local rp, onScreen = cam:WorldToViewportPoint(root.Position)
+	if not onScreen then
+		hideObj(d)
+		return true
+	end
+	local topP = cam:WorldToViewportPoint(head.Position + Vector3.new(0, 0.8, 0))
+	local botP = cam:WorldToViewportPoint(root.Position - Vector3.new(0, 3.2, 0))
+	local h = math.abs(botP.Y - topP.Y)
+	local w = h * 0.55
+
+	for i, pair in ipairs(bones) do
+		local ln = d.bones[i]
+		local a, b = nil, nil
+		if S.skeleton then
+			a, b = m:FindFirstChild(pair[1]), m:FindFirstChild(pair[2])
+		end
+		if a and b then
+			local pa, va = cam:WorldToViewportPoint(a.Position)
+			local pb, vb = cam:WorldToViewportPoint(b.Position)
+			ln.From, ln.To = Vector2.new(pa.X, pa.Y), Vector2.new(pb.X, pb.Y)
+			ln.Color, ln.Thickness = col, S.thick
+			ln.Visible = va and vb
+		else
+			ln.Visible = false
+		end
+	end
+
+	local bx = d.box
+	if S.box then
+		bx.Size = Vector2.new(w, h)
+		bx.Position = Vector2.new(rp.X - w / 2, topP.Y)
+		bx.Color, bx.Thickness, bx.Visible = col, S.thick, true
+	else
+		bx.Visible = false
+	end
+
+	local tr = d.tracer
+	if S.tracers then
+		tr.From, tr.To = Vector2.new(vp.X / 2, vp.Y), Vector2.new(rp.X, botP.Y)
+		tr.Color, tr.Thickness, tr.Visible = col, 1, true
+	else
+		tr.Visible = false
+	end
+
+	local nm = d.name
+	if S.name then
+		nm.Text = p and p.Name or m.Name
+		nm.Position = Vector2.new(rp.X, topP.Y - 16)
+		nm.Color, nm.Visible = col, true
+	else
+		nm.Visible = false
+	end
+
+	local ds = d.dist
+	if S.dist then
+		ds.Text = "[" .. math.floor(dist) .. "m]"
+		ds.Position = Vector2.new(rp.X, botP.Y + 2)
+		ds.Color, ds.Visible = col, true
+	else
+		ds.Visible = false
+	end
+
+	local hb = d.hp
+	if S.health and hp and mhp and mhp > 0 then
+		local r = math.clamp(hp / mhp, 0, 1)
+		local x = rp.X - w / 2 - 5
+		hb.From, hb.To = Vector2.new(x, botP.Y), Vector2.new(x, botP.Y - h * r)
+		hb.Color, hb.Thickness, hb.Visible = Color3.fromHSV(r * 0.33, 1, 1), 2, true
+	else
+		hb.Visible = false
+	end
+	return true
+end
+
+local espWasOn, statusT = false, 0
+local seenFrame = {}
+
+local function espStep()
+	cam = workspace.CurrentCamera
+	if not S.esp then
+		if espWasOn then
+			espWasOn = false
+			for _, d in pairs(objs) do hideObj(d) end
+			for m in pairs(hlSet) do setHL(m, false) end
+		end
+		return
+	end
+	espWasOn = true
+	local col = C(S.espColor)
+	local camPos, vp = cam.CFrame.Position, cam.ViewportSize
+	local list = collect()
+	for k in pairs(seenFrame) do seenFrame[k] = nil end
+	hlCount = 0
+
+	local shown = 0
+	for i = 1, #list do
+		local ok, res = pcall(drawTarget, list[i], col, camPos, vp)
+		if ok then
+			if res then
+				seenFrame[list[i].m] = true
+				shown = shown + 1
+			end
+		else
+			lastErr = "esp: " .. tostring(res)
+		end
+	end
+
+	-- всё, что не показали в этом кадре, прячем; мёртвые модели удаляем
+	for m, d in pairs(objs) do
+		if not seenFrame[m] then
+			hideObj(d)
+			if not m:IsDescendantOf(game) then removeObj(m) end
+		end
+	end
+	for m in pairs(hlSet) do
+		if not seenFrame[m] then setHL(m, false) end
+	end
+
+	local now = os.clock()
+	if statusLbl and now - statusT > 0.4 then
+		statusT = now
+		statusLbl.Text = string.format("Found: %d  Shown: %d\nDrawing: %s\nMy team: %s\nErr: %s",
+			#list, shown, hasDrawing and "yes" or "NO (chams)", tostring(teamOf(lp.Character, lp)),
+			lastErr or "none")
+	end
+end
+
+---------------------------------------------------------------- visuals: камера
+local fovSaved = nil
+
+local function camStep()
+	cam = workspace.CurrentCamera
+	if S.fovOn then
+		if not fovSaved then fovSaved = cam.FieldOfView end
+		cam.FieldOfView = S.fov
+	elseif fovSaved then
+		cam.FieldOfView = fovSaved
+		fovSaved = nil
+	end
+	if S.stretch then
+		cam.CFrame = cam.CFrame * CFrame.new(0, 0, 0, 1, 0, 0, 0, S.stretchAmt, 0, 0, 0, 1)
+	end
+end
+
+---------------------------------------------------------------- visuals: мир
+local saved = {}
+
+-- если want ~= nil, держим значение; если nil, возвращаем то, что было до нас
+local function lightRule(key, obj, prop, want)
+	if want ~= nil then
+		if obj == nil then return end
+		if saved[key] == nil then saved[key] = {obj, obj[prop]} end
+		if obj[prop] ~= want then obj[prop] = want end
+	elseif saved[key] ~= nil then
+		local o, v = saved[key][1], saved[key][2]
+		if o and o.Parent then o[prop] = v end
+		saved[key] = nil
+	end
+end
+
+local function lightStep()
+	local wBr, wSh, wAmb, wOut, wFe, wDen, wHz, wCl
+	if S.fullbright then
+		wBr, wSh = 2, false
+		wAmb = Color3.fromRGB(178, 178, 178)
+		wOut = wAmb
+	end
+	if S.tintOn then
+		wAmb = C(S.tint)
+		wOut = wAmb
+	end
+	if S.noFog then wFe, wDen, wHz = 9e9, 0, 0 end
+	if S.timeOn then wCl = S.clock end
+	local atm = Lighting:FindFirstChildOfClass("Atmosphere")
+	lightRule("br", Lighting, "Brightness", wBr)
+	lightRule("sh", Lighting, "GlobalShadows", wSh)
+	lightRule("am", Lighting, "Ambient", wAmb)
+	lightRule("ou", Lighting, "OutdoorAmbient", wOut)
+	lightRule("fe", Lighting, "FogEnd", wFe)
+	lightRule("cl", Lighting, "ClockTime", wCl)
+	lightRule("de", atm, "Density", wDen)
+	lightRule("hz", atm, "Haze", wHz)
+end
+
+local cc, bl = nil, nil
+
+local function fxStep()
+	if S.ccOn then
+		if not cc or not cc.Parent then
+			cc = Instance.new("ColorCorrectionEffect")
+			cc.Name = "xD_cc"
+			cc.Parent = Lighting
+		end
+		cc.Saturation, cc.Contrast, cc.Brightness = S.sat, S.contrast, S.bright
+	elseif cc then
+		cc:Destroy()
+		cc = nil
+	end
+	if S.bloom then
+		if not bl or not bl.Parent then
+			bl = Instance.new("BloomEffect")
+			bl.Name = "xD_bloom"
+			bl.Size, bl.Threshold = 24, 0.8
+			bl.Parent = Lighting
+		end
+		bl.Intensity = S.bloomInt
+	elseif bl then
+		bl:Destroy()
+		bl = nil
+	end
+end
+
+-- снег: невидимая плита над камерой с ParticleEmitter (лежит в Camera, на клиенте)
+local snowPart, snowEm = nil, nil
+
+local function snowStep()
+	if not S.snow then
+		if snowPart then
+			snowPart:Destroy()
+			snowPart, snowEm = nil, nil
+		end
+		return
+	end
+	cam = workspace.CurrentCamera
+	if not snowPart or not snowPart.Parent then
+		snowPart = Instance.new("Part")
+		snowPart.Name = "xD_snow"
+		snowPart.Anchored, snowPart.CanCollide = true, false
+		snowPart.CanTouch, snowPart.CanQuery, snowPart.CastShadow = false, false, false
+		snowPart.Transparency = 1
+		snowPart.Size = Vector3.new(110, 1, 110)
+		snowEm = Instance.new("ParticleEmitter")
+		snowEm.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+		snowEm.EmissionDirection = Enum.NormalId.Bottom
+		snowEm.Lifetime = NumberRange.new(7, 9)
+		snowEm.Speed = NumberRange.new(6, 10)
+		snowEm.SpreadAngle = Vector2.new(20, 20)
+		snowEm.Size = NumberSequence.new(0.22)
+		snowEm.Transparency = NumberSequence.new(0.1)
+		snowEm.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		snowEm.LightEmission = 0.4
+		snowEm.Rotation = NumberRange.new(0, 360)
+		snowEm.RotSpeed = NumberRange.new(-60, 60)
+		snowEm.Parent = snowPart
+	end
+	if snowPart.Parent ~= cam then snowPart.Parent = cam end
+	snowPart.CFrame = CFrame.new(cam.CFrame.Position + Vector3.new(0, 38, 0))
+	snowEm.Rate = 120 * S.snowAmt
+	snowEm.Acceleration = Vector3.new(S.snowWind, 0, S.snowWind * 0.4)
+end
+
+local sLight, sFx, sSnow = safe("light", lightStep), safe("fx", fxStep), safe("snow", snowStep)
+
+local function worldStep()
+	sLight()
+	sFx()
+	sSnow()
+end
+
+---------------------------------------------------------------- universal + antishki (движение)
+local mv = {
+	char = nil, boosted = false, base = 16, fixedOn = false, preFixed = 16,
+	ar = nil, neck = nil, neckC0 = nil, jit = 1, jit2 = 1,
+}
+local uniT = 0
+
+local function speedStep(hum)
+	-- fRtmmx: постоянная скорость, в том числе после респавна
+	if S.fixed then
+		if not mv.fixedOn then
+			mv.fixedOn = true
+			mv.preFixed = mv.boosted and mv.base or hum.WalkSpeed
+			mv.boosted = false
+		end
+		if hum.WalkSpeed ~= S.fixedSpeed then hum.WalkSpeed = S.fixedSpeed end
+		return
+	elseif mv.fixedOn then
+		mv.fixedOn = false
+		hum.WalkSpeed = mv.preFixed
+	end
+
+	-- bhop: скорость повышается только пока ты в прыжке/падении, на земле обычная
+	if S.bhop or S.bhopStrafe then
+		local st = hum:GetState()
+		local air = st == Enum.HumanoidStateType.Jumping or st == Enum.HumanoidStateType.Freefall
+		local target = S.bhopStrafe and S.strafeSpeed or S.bhopSpeed
+		if air then
+			if not mv.boosted then
+				mv.base = hum.WalkSpeed
+				mv.boosted = true
+			end
+			if hum.WalkSpeed ~= target then hum.WalkSpeed = target end
+		elseif mv.boosted then
+			hum.WalkSpeed = mv.base
+			mv.boosted = false
+		end
+	elseif mv.boosted then
+		hum.WalkSpeed = mv.base
+		mv.boosted = false
+	end
+end
+
+local function yawStep(hum, root)
+	if S.yawMode == 1 then
+		if mv.ar ~= nil then
+			hum.AutoRotate = mv.ar
+			mv.ar = nil
+		end
+		return
+	end
+	if mv.ar == nil then mv.ar = hum.AutoRotate end
+	hum.AutoRotate = false
+	local look = cam.CFrame.LookVector
+	local camYaw = math.atan2(-look.X, -look.Z)
+	local pos = root.Position
+	if S.yawMode == 2 then -- Spin
+		root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(S.spinSpeed), 0)
+	elseif S.yawMode == 3 then -- Jitter (спиной к камере, качаем влево-вправо)
+		mv.jit = -mv.jit
+		root.CFrame = CFrame.new(pos) * CFrame.Angles(0, camYaw + math.pi + math.rad(S.jitAngle) * mv.jit, 0)
+	else -- Backwards
+		root.CFrame = CFrame.new(pos) * CFrame.Angles(0, camYaw + math.pi, 0)
+	end
+end
+
+local function pitchStep(c)
+	if S.pitchMode == 1 then
+		if mv.neck and mv.neckC0 then
+			if mv.neck.Parent then mv.neck.C0 = mv.neckC0 end
+			mv.neck, mv.neckC0 = nil, nil
+		end
+		return
+	end
+	local neck = c:FindFirstChild("Neck", true)
+	if not (neck and neck:IsA("Motor6D")) then return end
+	if mv.neck ~= neck then
+		mv.neck = neck
+		mv.neckC0 = neck.C0
+	end
+	local ang = math.rad(S.pitchAngle)
+	if S.pitchMode == 2 then -- Down
+		ang = -ang
+	elseif S.pitchMode == 4 then -- Jitter
+		mv.jit2 = -mv.jit2
+		ang = ang * mv.jit2
+	end
+	-- вращаем вокруг оси X торса в точке шеи, поэтому работает и для R6, и для R15
+	local base = mv.neckC0
+	neck.C0 = CFrame.new(base.Position) * CFrame.Angles(ang, 0, 0) * (base - base.Position)
+end
+
+local function restoreMove()
+	local c = lp.Character
+	local hum = c and c:FindFirstChildOfClass("Humanoid")
+	if hum then
+		if mv.boosted then hum.WalkSpeed = mv.base end
+		if mv.fixedOn then hum.WalkSpeed = mv.preFixed end
+		if mv.ar ~= nil then hum.AutoRotate = mv.ar end
+	end
+	if mv.neck and mv.neckC0 and mv.neck.Parent then mv.neck.C0 = mv.neckC0 end
+end
+
+local function moveStep()
+	cam = workspace.CurrentCamera
+	local c = lp.Character
+	if c ~= mv.char then
+		mv.char = c
+		mv.boosted, mv.fixedOn, mv.ar, mv.neck, mv.neckC0 = false, false, nil, nil, nil
+	end
+	local hum = c and c:FindFirstChildOfClass("Humanoid")
+	local root = c and c:FindFirstChild("HumanoidRootPart")
+	if not hum or not root or hum.Health <= 0 then return end
+	speedStep(hum)
+	yawStep(hum, root)
+	pitchStep(c)
+	local now = os.clock()
+	if uniLbl and now - uniT > 0.3 then
+		uniT = now
+		uniLbl.Text = string.format("WalkSpeed: %.1f\nState: %s", hum.WalkSpeed, hum:GetState().Name)
+	end
+end
+
+---------------------------------------------------------------- UI: помощники
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+
+local function stroke(o, col)
+	return new("UIStroke", {
+		Color = col or LINE, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, o)
+end
+
+local ord = 0
+local function nxt() ord = ord + 1 return ord end
+
+local dragFn = nil
+bind(UIS.InputChanged, function(i)
+	if dragFn and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+		dragFn(i.Position)
+	end
+end)
+bind(UIS.InputEnded, function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+		dragFn = nil
+	end
+end)
+
+-- перетаскивание; возвращает функцию "это нажатие было перетаскиванием?"
+local function makeDraggable(handle, target)
+	local start, orig, moved = nil, nil, false
+	handle.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			start, orig, moved = i.Position, target.Position, false
+			dragFn = function(pos)
+				local d = pos - start
+				if d.Magnitude > 4 then moved = true end
+				target.Position = UDim2.new(orig.X.Scale, orig.X.Offset + d.X, orig.Y.Scale, orig.Y.Offset + d.Y)
+			end
+		end
+	end)
+	return function() return moved end
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name, gui.ResetOnSpawn, gui.IgnoreGuiInset = "xDpwr", false, true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+if not gui.Parent then gui.Parent = lp:WaitForChild("PlayerGui") end
+
+---------------------------------------------------------------- лого: перевёрнутый треугольник с ушками
+-- треугольники собираются из горизонтальных полосок, поэтому ассеты не нужны
+local function tri(parent, x, y, w, h, down, colorFn)
+	local rows = math.max(2, math.floor(h / 2))
+	local rh = h / rows
+	local frs = {}
+	for i = 0, rows - 1 do
+		local f = down and (rows - i) / rows or (i + 1) / rows
+		local rw = math.max(1, math.floor(w * f + 0.5))
+		frs[#frs + 1] = new("Frame", {
+			Size = UDim2.fromOffset(rw, math.ceil(rh)),
+			Position = UDim2.fromOffset(x + math.floor((w - rw) / 2), y + math.floor(i * rh)),
+			BorderSizePixel = 0,
+		}, parent)
+	end
+	onAccent(function()
+		local c = colorFn()
+		for _, fr in ipairs(frs) do fr.BackgroundColor3 = c end
+	end)
+end
+
+local function makeLogo(parent, s, x, y)
+	local h = new("Frame", {Size = UDim2.fromOffset(s, s), Position = UDim2.fromOffset(x, y), BackgroundTransparency = 1}, parent)
+	local function P(f) return math.floor(s * f + 0.5) end
+	local function earCol() return shade(A(), 0.7) end
+	tri(h, P(0.06), P(0.00), P(0.26), P(0.38), false, earCol)  -- левое ушко
+	tri(h, P(0.68), P(0.00), P(0.26), P(0.38), false, earCol)  -- правое ушко
+	tri(h, P(0.06), P(0.30), P(0.88), P(0.66), true, A)        -- большой перевёрнутый треугольник
+	tri(h, P(0.33), P(0.46), P(0.34), P(0.30), true, function() return Color3.fromRGB(235, 235, 245) end)
+	return h
+end
+
+---------------------------------------------------------------- главное окно (только прямые углы)
+local WIN_W, WIN_H, SIDE_W = 640, 420, 150
+
+local main = new("Frame", {
+	Size = UDim2.fromOffset(WIN_W, WIN_H), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+	BackgroundColor3 = BG, BackgroundTransparency = S.winAlpha, BorderSizePixel = 0, ZIndex = 5,
+}, gui)
+stroke(main)
+
+local side = new("Frame", {
+	Size = UDim2.fromOffset(SIDE_W, WIN_H), BackgroundColor3 = SIDE, BackgroundTransparency = S.winAlpha, BorderSizePixel = 0,
+}, main)
+new("Frame", {Size = UDim2.fromOffset(1, WIN_H), Position = UDim2.fromOffset(SIDE_W - 1, 0), BackgroundColor3 = LINE, BorderSizePixel = 0}, side)
+
+local topLine = new("Frame", {Size = UDim2.new(1, 0, 0, 2), BorderSizePixel = 0}, main)
+onAccent(function() topLine.BackgroundColor3 = A() end)
+
+makeLogo(side, 44, 14, 18)
+new("TextLabel", {
+	Position = UDim2.fromOffset(66, 22), Size = UDim2.fromOffset(80, 22), BackgroundTransparency = 1,
+	Text = "xDpwr", Font = Enum.Font.GothamBlack, TextSize = 17, TextColor3 = TXT, TextXAlignment = Enum.TextXAlignment.Left,
+}, side)
+new("TextLabel", {
+	Position = UDim2.fromOffset(66, 42), Size = UDim2.fromOffset(80, 14), BackgroundTransparency = 1,
+	Text = "v2", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = DIM, TextXAlignment = Enum.TextXAlignment.Left,
+}, side)
+new("TextLabel", {
+	Position = UDim2.new(0, 14, 1, -24), Size = UDim2.fromOffset(130, 14), BackgroundTransparency = 1,
+	Text = "RightShift - hide", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = DIM, TextXAlignment = Enum.TextXAlignment.Left,
+}, side)
+
+local title = new("TextLabel", {
+	Position = UDim2.fromOffset(SIDE_W + 14, 10), Size = UDim2.fromOffset(300, 24), BackgroundTransparency = 1,
+	Text = "ESP", Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = TXT, TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+new("Frame", {
+	Size = UDim2.new(1, -SIDE_W, 0, 1), Position = UDim2.fromOffset(SIDE_W, 40), BackgroundColor3 = LINE, BorderSizePixel = 0,
+}, main)
+
+---------------------------------------------------------------- вкладки и элементы
+local tabs, tabCount = {}, 0
+local togRefs = {}
+
+local function selectTab(name)
+	for n, t in pairs(tabs) do
+		local on = n == name
+		t.page.Visible = on
+		t.btn.BackgroundTransparency = on and 0 or 1
+		t.lbl.TextColor3 = on and TXT or DIM
+		t.bar.Visible = on
+	end
+	title.Text = name
+end
+
+local function addTab(name)
+	tabCount = tabCount + 1
+	local btn = new("TextButton", {
+		Size = UDim2.new(1, -20, 0, 30), Position = UDim2.fromOffset(10, 78 + (tabCount - 1) * 34),
+		BackgroundColor3 = EL, BackgroundTransparency = 1, BorderSizePixel = 0, Text = "", AutoButtonColor = false,
+	}, side)
+	local lbl = new("TextLabel", {
+		Position = UDim2.fromOffset(14, 0), Size = UDim2.new(1, -14, 1, 0), BackgroundTransparency = 1, Text = name,
+		Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = DIM, TextXAlignment = Enum.TextXAlignment.Left,
+	}, btn)
+	local bar = new("Frame", {Size = UDim2.new(0, 2, 1, 0), BorderSizePixel = 0, Visible = false}, btn)
+	onAccent(function() bar.BackgroundColor3 = A() end)
+
+	local page = new("Frame", {
+		Size = UDim2.fromOffset(WIN_W - SIDE_W - 20, WIN_H - 60), Position = UDim2.fromOffset(SIDE_W + 10, 50),
+		BackgroundTransparency = 1, Visible = false,
+	}, main)
+	local function column(x)
+		local c = new("ScrollingFrame", {
+			Size = UDim2.fromOffset(230, WIN_H - 60), Position = UDim2.fromOffset(x, 0), BackgroundTransparency = 1,
+			BorderSizePixel = 0, ScrollBarThickness = 2, ScrollBarImageColor3 = LINE,
+			CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		}, page)
+		new("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, c)
+		return c
+	end
+	tabs[name] = {btn = btn, lbl = lbl, bar = bar, page = page}
+	btn.MouseButton1Click:Connect(function() selectTab(name) end)
+	return column(0), column(240)
+end
+
+local function section(col, text)
+	local s = new("Frame", {
+		Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = EL,
+		BorderSizePixel = 0, LayoutOrder = nxt(),
+	}, col)
+	stroke(s)
+	new("UIPadding", {
+		PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10),
+	}, s)
+	new("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder}, s)
+	local t = new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1, Text = string.upper(text), Font = Enum.Font.GothamBold,
+		TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nxt(),
+	}, s)
+	onAccent(function() t.TextColor3 = A() end)
+	new("Frame", {Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = LINE, BorderSizePixel = 0, LayoutOrder = nxt()}, s)
+	return s
+end
+
+local function setToggle(key, v)
+	S[key] = v
+	if togRefs[key] then togRefs[key]() end
+end
+
+local function toggle(parent, text, key, cb)
+	local row = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, LayoutOrder = nxt(),
+	}, parent)
+	new("TextLabel", {
+		Size = UDim2.new(1, -24, 1, 0), BackgroundTransparency = 1, Text = text, Font = Enum.Font.Gotham, TextSize = 13,
+		TextColor3 = TXT, TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local box = new("Frame", {
+		Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0),
+		BackgroundColor3 = EL2, BorderSizePixel = 0,
+	}, row)
+	stroke(box)
+	local function refresh()
+		box.BackgroundColor3 = S[key] and A() or EL2
+	end
+	row.MouseButton1Click:Connect(function()
+		S[key] = not S[key]
+		refresh()
+		if cb then cb(S[key]) end
+	end)
+	togRefs[key] = refresh
+	onAccent(refresh)
+end
+
+local function defaultFmt(v) return tostring(math.floor(v * 100 + 0.5) / 100) end
+
+local function slider(parent, text, min, max, step, get, set, fmt)
+	fmt = fmt or defaultFmt
+	local row = new("Frame", {Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, LayoutOrder = nxt()}, parent)
+	new("TextLabel", {
+		Size = UDim2.new(1, -54, 0, 16), BackgroundTransparency = 1, Text = text, Font = Enum.Font.Gotham, TextSize = 13,
+		TextColor3 = TXT, TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local val = new("TextLabel", {
+		Size = UDim2.new(0, 54, 0, 16), Position = UDim2.new(1, -54, 0, 0), BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = DIM, TextXAlignment = Enum.TextXAlignment.Right,
+	}, row)
+	local hit = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 18), Position = UDim2.fromOffset(0, 16), BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
+	}, row)
+	local bar = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 4), Position = UDim2.new(0, 0, 0.5, -2), BackgroundColor3 = EL2, BorderSizePixel = 0,
+	}, hit)
+	local fill = new("Frame", {Size = UDim2.new(0, 0, 1, 0), BorderSizePixel = 0}, bar)
+	new("Frame", {
+		Size = UDim2.fromOffset(6, 12), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(1, 0, 0.5, 0),
+		BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+	}, fill)
+	onAccent(function() fill.BackgroundColor3 = A() end)
+
+	local function refresh()
+		local v = get()
+		fill.Size = UDim2.new(math.clamp((v - min) / (max - min), 0, 1), 0, 1, 0)
+		val.Text = fmt(v)
+	end
+	local function setFrom(x)
+		local r = math.clamp((x - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
+		local v = min + (max - min) * r
+		v = math.clamp(math.floor(v / step + 0.5) * step, min, max)
+		set(v)
+		refresh()
+	end
+	hit.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			setFrom(i.Position.X)
+			dragFn = function(pos) setFrom(pos.X) end
+		end
+	end)
+	refresh()
+end
+
+-- кнопка-переключатель по кругу (Off / Spin / Jitter ...)
+local function selector(parent, text, opts, get, set)
+	local row = new("Frame", {Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, LayoutOrder = nxt()}, parent)
+	new("TextLabel", {
+		Size = UDim2.new(1, -96, 1, 0), BackgroundTransparency = 1, Text = text, Font = Enum.Font.Gotham, TextSize = 13,
+		TextColor3 = TXT, TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local b = new("TextButton", {
+		Size = UDim2.fromOffset(92, 22), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0),
+		BackgroundColor3 = EL2, BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamMedium,
+		TextSize = 12, TextColor3 = TXT, Text = opts[get()],
+	}, row)
+	stroke(b)
+	b.MouseButton1Click:Connect(function()
+		local i = get() + 1
+		if i > #opts then i = 1 end
+		set(i)
+		b.Text = opts[i]
+	end)
+end
+
+local function button(parent, text, cb)
+	local b = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = EL2, BorderSizePixel = 0, Text = text, Font = Enum.Font.GothamMedium,
+		TextSize = 13, TextColor3 = TXT, AutoButtonColor = true, LayoutOrder = nxt(),
+	}, parent)
+	stroke(b)
+	b.MouseButton1Click:Connect(cb)
+end
+
+local function info(parent, text)
+	return new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = text,
+		Font = Enum.Font.Code, TextSize = 11, TextColor3 = DIM, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top, LayoutOrder = nxt(),
+	}, parent)
+end
+
+local function colorPicker(parent, text, t, cb)
+	local head = new("Frame", {Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1, LayoutOrder = nxt()}, parent)
+	new("TextLabel", {
+		Size = UDim2.new(1, -36, 1, 0), BackgroundTransparency = 1, Text = text, Font = Enum.Font.Gotham, TextSize = 13,
+		TextColor3 = TXT, TextXAlignment = Enum.TextXAlignment.Left,
+	}, head)
+	local sw = new("Frame", {
+		Size = UDim2.fromOffset(30, 14), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0),
+		BackgroundColor3 = C(t), BorderSizePixel = 0,
+	}, head)
+	stroke(sw)
+	for i, n in ipairs({"R", "G", "B"}) do
+		slider(parent, n, 0, 255, 1, function() return t[i] end, function(v)
+			t[i] = v
+			sw.BackgroundColor3 = C(t)
+			if cb then cb() end
+		end, function(v) return tostring(v) end)
+	end
+end
+
+---------------------------------------------------------------- прицел (Visuals)
+local crossFrame = nil
+
+local function updateCross()
+	if crossFrame then
+		crossFrame:Destroy()
+		crossFrame = nil
+	end
+	if not S.cross then return end
+	crossFrame = new("Frame", {Size = UDim2.fromOffset(0, 0), Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1}, gui)
+	local col, g, l, t = C(S.crossColor), S.crossGap, S.crossSize, S.crossThick
+	local ht = math.floor(t / 2)
+	local function bar(x, y, w, h)
+		new("Frame", {
+			Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, h), BackgroundColor3 = col, BorderSizePixel = 0,
+		}, crossFrame)
+	end
+	bar(-ht, -g - l, t, l) -- верх
+	bar(-ht, g, t, l)      -- низ
+	bar(-g - l, -ht, l, t) -- лево
+	bar(g, -ht, l, t)      -- право
+	if S.crossDot then bar(-ht, -ht, t, t) end
+end
+
+---------------------------------------------------------------- содержимое вкладок
+do -- ESP
+	local L, R = addTab("ESP")
+	local s = section(L, "Main")
+	toggle(s, "Enabled", "esp")
+	toggle(s, "Skeleton", "skeleton")
+	toggle(s, "Box", "box")
+	toggle(s, "Name", "name")
+	toggle(s, "Distance", "dist")
+	toggle(s, "Health bar", "health")
+	toggle(s, "Tracers", "tracers")
+	toggle(s, "Chams (Highlight)", "chams")
+
+	local f = section(R, "Filters")
+	toggle(f, "Team check", "team")
+	toggle(f, "Non-player models", "nonPlayers")
+	slider(f, "Max distance", 100, 5000, 50, function() return S.maxDist end, function(v) S.maxDist = v end)
+	slider(f, "Line thickness", 1, 4, 0.5, function() return S.thick end, function(v) S.thick = v end)
+	slider(f, "Chams fill", 0, 1, 0.05, function() return S.chamsFill end, function(v) S.chamsFill = v end)
+
+	local c = section(R, "ESP color")
+	colorPicker(c, "Color", S.espColor)
+
+	local st = section(L, "Status")
+	statusLbl = info(st, "waiting for ESP...")
+end
+
+do -- Visuals
+	local L, R = addTab("Visuals")
+	local s = section(L, "Camera")
+	toggle(s, "Custom FOV", "fovOn")
+	slider(s, "FOV (max 120)", 30, 120, 1, function() return S.fov end, function(v) S.fov = v end)
+	toggle(s, "Stretch screen", "stretch")
+	slider(s, "Stretch (lower = wider)", 0.4, 1, 0.01, function() return S.stretchAmt end, function(v) S.stretchAmt = v end)
+
+	local x = section(L, "Crosshair")
+	toggle(x, "Enabled", "cross", updateCross)
+	toggle(x, "Center dot", "crossDot", updateCross)
+	slider(x, "Size", 2, 30, 1, function() return S.crossSize end, function(v) S.crossSize = v updateCross() end)
+	slider(x, "Gap", 0, 20, 1, function() return S.crossGap end, function(v) S.crossGap = v updateCross() end)
+	slider(x, "Thickness", 1, 6, 1, function() return S.crossThick end, function(v) S.crossThick = v updateCross() end)
+	colorPicker(x, "Color", S.crossColor, updateCross)
+
+	local w = section(R, "World")
+	toggle(w, "Fullbright", "fullbright")
+	toggle(w, "No fog", "noFog")
+	toggle(w, "Custom time", "timeOn")
+	slider(w, "Clock time", 0, 24, 0.25, function() return S.clock end, function(v) S.clock = v end)
+	toggle(w, "World tint", "tintOn")
+	colorPicker(w, "Tint", S.tint)
+
+	local e = section(R, "Effects")
+	toggle(e, "Color correction", "ccOn")
+	slider(e, "Saturation", -1, 1, 0.05, function() return S.sat end, function(v) S.sat = v end)
+	slider(e, "Contrast", -1, 1, 0.05, function() return S.contrast end, function(v) S.contrast = v end)
+	slider(e, "Brightness", -0.3, 0.3, 0.02, function() return S.bright end, function(v) S.bright = v end)
+	toggle(e, "Bloom", "bloom")
+	slider(e, "Bloom intensity", 0, 2, 0.05, function() return S.bloomInt end, function(v) S.bloomInt = v end)
+
+	local sn = section(R, "Snow")
+	toggle(sn, "Snow", "snow")
+	slider(sn, "Amount", 0.2, 3, 0.1, function() return S.snowAmt end, function(v) S.snowAmt = v end)
+	slider(sn, "Wind", -10, 10, 0.5, function() return S.snowWind end, function(v) S.snowWind = v end)
+end
+
+do -- Universal
+	local L, R = addTab("Universal")
+	local s = section(L, "Movement")
+	toggle(s, "Bhop", "bhop", function(on) if on then setToggle("bhopStrafe", false) end end)
+	slider(s, "Bhop air speed", 16, 60, 1, function() return S.bhopSpeed end, function(v) S.bhopSpeed = v end)
+	toggle(s, "Bhop + Strafe", "bhopStrafe", function(on) if on then setToggle("bhop", false) end end)
+	slider(s, "Strafe air speed", 16, 80, 1, function() return S.strafeSpeed end, function(v) S.strafeSpeed = v end)
+	toggle(s, "fRtmmx (fixed speed)", "fixed")
+	slider(s, "fRtmmx speed", 8, 80, 1, function() return S.fixedSpeed end, function(v) S.fixedSpeed = v end)
+
+	local i = section(R, "Info")
+	info(i, "Bhop: speed rises only while you are in the air (jump yourself, hold Space). Walking speed stays as in the game.\n\nBhop + Strafe: same, but with its own, higher air speed.\n\nfRtmmx: constant speed on the ground and in the air, also after respawn.")
+	local d = section(R, "Live")
+	uniLbl = info(d, "-")
+end
+
+do -- Antishki
+	local L, R = addTab("Antishki")
+	local y = section(L, "Yaw")
+	selector(y, "Mode", {"Off", "Spin", "Jitter", "Back"}, function() return S.yawMode end, function(v) S.yawMode = v end)
+	slider(y, "Spin speed", 1, 90, 1, function() return S.spinSpeed end, function(v) S.spinSpeed = v end)
+	slider(y, "Jitter angle", 10, 180, 5, function() return S.jitAngle end, function(v) S.jitAngle = v end)
+
+	local p = section(R, "Pitch")
+	selector(p, "Mode", {"Off", "Down", "Up", "Jitter"}, function() return S.pitchMode end, function(v) S.pitchMode = v end)
+	slider(p, "Angle", 0, 90, 1, function() return S.pitchAngle end, function(v) S.pitchAngle = v end)
+
+	local n = section(R, "Note")
+	info(n, "Test features. Spin / Jitter / Back turn your character, Pitch tilts the head. What other players see depends on the game.")
+end
+
+do -- Menu
+	local L, R = addTab("Menu")
+	local s = section(L, "Accent color")
+	colorPicker(s, "Color", S.accent, applyAccent)
+
+	local w = section(R, "Window")
+	slider(w, "Transparency", 0, 0.5, 0.05, function() return S.winAlpha end, function(v)
+		S.winAlpha = v
+		main.BackgroundTransparency = v
+		side.BackgroundTransparency = v
+	end)
+	button(w, "Unload script", function() if getgenv and getgenv().xDpwr then getgenv().xDpwr() end end)
+end
+
+selectTab("ESP")
+
+---------------------------------------------------------------- перетаскивание, кнопка скрытия, хоткей
+local topbar = new("Frame", {Size = UDim2.new(1, -40, 0, 40), BackgroundTransparency = 1, Active = true}, main)
+makeDraggable(topbar, main)
+
+local hideBtn = new("TextButton", {
+	Size = UDim2.fromOffset(26, 22), Position = UDim2.new(1, -36, 0, 9), BackgroundColor3 = EL2, BorderSizePixel = 0,
+	Text = "-", Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = TXT, AutoButtonColor = true,
+}, main)
+stroke(hideBtn)
+
+-- плавающая кнопка с лого: клик прячет и показывает меню, можно таскать
+local floatBtn = new("Frame", {
+	Size = UDim2.fromOffset(52, 52), Position = UDim2.fromOffset(24, 140), BackgroundColor3 = BG, BorderSizePixel = 0, ZIndex = 6,
+}, gui)
+stroke(floatBtn)
+makeLogo(floatBtn, 38, 7, 7)
+local hit = new("TextButton", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 5}, floatBtn)
+local wasDragged = makeDraggable(hit, floatBtn)
+
+local function toggleMenu() main.Visible = not main.Visible end
+hit.MouseButton1Click:Connect(function() if not wasDragged() then toggleMenu() end end)
+hideBtn.MouseButton1Click:Connect(toggleMenu)
+bind(UIS.InputBegan, function(i, gp)
+	if not gp and i.KeyCode == Enum.KeyCode.RightShift then toggleMenu() end
+end)
+
+---------------------------------------------------------------- запуск шагов
+RS:BindToRenderStep("xDpwr_cam", Enum.RenderPriority.Camera.Value + 1, safe("cam", camStep))
+RS:BindToRenderStep("xDpwr_esp", Enum.RenderPriority.Camera.Value + 2, safe("esp", espStep))
+RS:BindToRenderStep("xDpwr_move", Enum.RenderPriority.Character.Value + 1, safe("move", moveStep))
+bind(RS.Heartbeat, worldStep)
+
+---------------------------------------------------------------- выгрузка
+local function unload()
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	pcall(function() RS:UnbindFromRenderStep("xDpwr_cam") end)
+	pcall(function() RS:UnbindFromRenderStep("xDpwr_esp") end)
+	pcall(function() RS:UnbindFromRenderStep("xDpwr_move") end)
+	pcall(restoreMove)
+	for m in pairs(objs) do removeObj(m) end
+	for m in pairs(hlSet) do pcall(setHL, m, false) end
+	if fovSaved then pcall(function() workspace.CurrentCamera.FieldOfView = fovSaved end) end
+	-- вернуть освещение: выключаем все правила
+	S.fullbright, S.noFog, S.timeOn, S.tintOn, S.ccOn, S.bloom, S.snow = false, false, false, false, false, false, false
+	pcall(lightStep)
+	pcall(fxStep)
+	pcall(snowStep)
+	if getgenv then getgenv().xDpwr = nil end
+	gui:Destroy()
+end
+if getgenv then getgenv().xDpwr = unload end
