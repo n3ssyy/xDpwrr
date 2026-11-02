@@ -1,44 +1,62 @@
--- xDpwr v2 | ESP, Visuals, Universal, Antishki
+-- xDpwr v3 | Aimbot, MM2, ESP, Visuals, Universal, Antishki
 -- RightShift или кнопка с лого: скрыть / показать меню
 
 local Players = game:GetService("Players")
 local RS = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
 local Lighting = game:GetService("Lighting")
+local HttpService = game:GetService("HttpService")
 local lp = Players.LocalPlayer
 local cam = workspace.CurrentCamera
+local VIM = nil
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
 
 -- если скрипт запущен повторно, убираем старую копию
 if getgenv and getgenv().xDpwr then pcall(getgenv().xDpwr) end
 
 ---------------------------------------------------------------- состояние
 local S = {
+	-- aimbot (камера)
+	aim = false, aimHold = 2, aimSmooth = 35, aimPart = 1,
+	predict = false, predictMs = 60, projSpeed = 0,
+	aimPrio = 1, aimTeam = false, aimVis = true, aimMax = 1500, aimNpc = false, sticky = false,
+	aimFov = 150, fovShow = true, fovFollow = 1, fovCol = {255, 255, 255}, fovThick = 1,
+	-- autoshoot
+	shoot = false, shootHold = 1, shootDelay = 60, shootInt = 150, shootPredict = false,
+	shootMode = 1, shootMove = true, shootRestore = true, shootNeedTool = false,
+	tracer = true, tracerMs = 250, tracerCol = {255, 80, 80},
+	-- mm2
+	mm2 = false, mm2Aim = 1, mm2Innocents = true, mm2Hud = true, mm2Drops = true,
+	cMurd = {255, 60, 60}, cSher = {60, 140, 255}, cInno = {80, 230, 120},
 	-- esp
 	esp = false, skeleton = true, box = false, name = true, dist = true, health = true,
-	tracers = false, chams = false, chamsFill = 0.7,
+	healthText = false, headDot = false, tracers = false, tracerOrigin = 1,
+	arrows = false, arrowRadius = 180, chams = false, chamsFill = 0.7,
 	team = false, nonPlayers = true, maxDist = 2000, thick = 1.5,
 	espColor = {255, 255, 255},
 	-- visuals: камера
 	fovOn = false, fov = 90, stretch = false, stretchAmt = 0.75,
+	zoomOn = false, zoomFov = 30, camOff = false, offX = 0, offY = 0, offZ = 0,
+	zoomLimit = false, zoomDist = 400,
 	-- visuals: мир
 	fullbright = false, noFog = false, timeOn = false, clock = 14,
 	tintOn = false, tint = {120, 160, 255},
 	ccOn = false, sat = 0, contrast = 0, bright = 0,
-	bloom = false, bloomInt = 0.6,
-	snow = false, snowAmt = 1, snowWind = 2,
+	bloom = false, bloomInt = 0.6, blur = false, blurSize = 12, sun = false, sunInt = 0.25,
+	weather = 1, wxAmt = 1, wxWind = 2,
 	-- visuals: прицел
 	cross = false, crossSize = 8, crossGap = 4, crossThick = 2, crossDot = false,
-	crossColor = {255, 255, 255},
+	crossSpin = false, crossSpinSpeed = 90, crossColor = {255, 255, 255},
 	-- universal
 	bhop = false, bhopSpeed = 21,
 	bhopStrafe = false, strafeSpeed = 29,
 	fixed = false, fixedSpeed = 21,
+	infJump = false, gravOn = false, gravity = 100,
 	-- antishki
 	yawMode = 1, spinSpeed = 25, jitAngle = 60,
 	pitchMode = 1, pitchAngle = 80,
 	-- меню
-	accent = {110, 90, 255},
-	winAlpha = 0,
+	accent = {110, 90, 255}, theme = 1, winAlpha = 0,
 }
 
 local function C(t) return Color3.fromRGB(t[1], t[2], t[3]) end
@@ -73,9 +91,41 @@ local function safe(tag, fn)
 	end
 end
 
-local statusLbl, uniLbl = nil, nil -- заполняются при создании меню
+local function nowMs() return os.clock() * 1000 end
 
----------------------------------------------------------------- ESP: поиск целей
+-- заполняются при создании меню
+local statusLbl, uniLbl, aimLbl, hudLbl, toastLbl = nil, nil, nil, nil, nil
+local main = nil
+local toastUntil = 0
+
+local function toast(text)
+	if toastLbl then
+		toastLbl.Text = text
+		toastUntil = os.clock() + 3
+	end
+end
+
+---------------------------------------------------------------- UI: базовые помощники
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+
+local function stroke(o, col)
+	return new("UIStroke", {
+		Color = col or LINE, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, o)
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name, gui.ResetOnSpawn, gui.IgnoreGuiInset = "xDpwr", false, true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+if not gui.Parent then gui.Parent = lp:WaitForChild("PlayerGui") end
+
+---------------------------------------------------------------- цели: игроки и модели из workspace
 -- Drawing есть не у всех инжекторов, поэтому проверяем безопасно
 local hasDrawing = pcall(function()
 	local l = Drawing.new("Line")
@@ -93,11 +143,15 @@ local bones = {
 	{"Torso", "Left Leg"}, {"Torso", "Right Leg"},
 }
 
--- Во многих играх (в т.ч. шутерах) персонажи лежат не в Player.Character,
--- а в папках workspace. Поэтому, кроме игроков, ловим любые модели с Humanoid.
-local extra = {}
+-- Во многих играх персонажи лежат не в Player.Character, а в папках workspace.
+-- Поэтому, кроме игроков, ловим любые модели с Humanoid.
+local extra, drops = {}, {}
 
 local function consider(inst)
+	if inst.Name == "GunDrop" and inst:IsA("BasePart") then
+		drops[inst] = true
+		return
+	end
 	local m = nil
 	if inst:IsA("Humanoid") then
 		m = inst.Parent
@@ -134,7 +188,7 @@ local function collect()
 			out[n] = {m = ch, p = p}
 		end
 	end
-	if S.nonPlayers then
+	if S.nonPlayers or S.aimNpc then
 		for m in pairs(extra) do
 			if not seen[m] and m ~= own and m.Parent then
 				seen[m] = true
@@ -146,7 +200,7 @@ local function collect()
 	return out
 end
 
----------------------------------------------------------------- ESP: команды и здоровье
+---------------------------------------------------------------- команды, здоровье, роли MM2
 local function readTeam(inst)
 	if not inst then return nil end
 	local a = inst:GetAttribute("Team")
@@ -187,8 +241,52 @@ local function healthOf(m, hum)
 	return h, mh
 end
 
+-- MM2: у убийцы в руках или в рюкзаке Knife, у шерифа Gun, остальные невиновные
+local MM2_PLACE = 142823291
+local roleCache = {}
+
+local function hasTool(box, word)
+	if not box then return false end
+	for _, it in ipairs(box:GetChildren()) do
+		if it:IsA("Tool") and string.find(string.lower(it.Name), word, 1, true) then return true end
+	end
+	return false
+end
+
+local function roleOf(p)
+	local r = roleCache[p]
+	if r then return r end
+	local bp = p:FindFirstChildOfClass("Backpack")
+	r = "Innocent"
+	if hasTool(p.Character, "knife") or hasTool(bp, "knife") then
+		r = "Murderer"
+	elseif hasTool(p.Character, "gun") or hasTool(bp, "gun") then
+		r = "Sheriff"
+	end
+	roleCache[p] = r
+	return r
+end
+
+local function roleCol(r)
+	if r == "Murderer" then return C(S.cMurd) end
+	if r == "Sheriff" then return C(S.cSher) end
+	return C(S.cInno)
+end
+
+-- кого можно выбирать целью в режиме MM2
+local function mm2Allowed(p)
+	if not S.mm2 or not p then return true end
+	local role = roleOf(p)
+	if S.mm2Aim == 4 then return true end
+	if S.mm2Aim == 2 then return role == "Murderer" end
+	if S.mm2Aim == 3 then return role == "Sheriff" end
+	-- Auto: убийца бьёт всех, остальные целятся только в убийцу
+	if roleOf(lp) == "Murderer" then return role ~= "Murderer" end
+	return role == "Murderer"
+end
+
 ---------------------------------------------------------------- ESP: объекты рисования
-local objs, hlSet = {}, {}
+local objs, hlSet, dropObjs = {}, {}, {}
 local hlCount = 0
 
 local function newObj()
@@ -205,10 +303,19 @@ local function newObj()
 	d.tracer.Visible = false
 	d.hp = Drawing.new("Line")
 	d.hp.Visible = false
+	d.a1 = Drawing.new("Line")
+	d.a1.Visible = false
+	d.a2 = Drawing.new("Line")
+	d.a2.Visible = false
 	d.name = Drawing.new("Text")
 	d.dist = Drawing.new("Text")
 	for _, t in ipairs({d.name, d.dist}) do
 		t.Center, t.Outline, t.Size, t.Visible = true, true, 13, false
+	end
+	local okc, circ = pcall(Drawing.new, "Circle")
+	if okc and circ then
+		circ.Filled, circ.Visible, circ.NumSides = false, false, 12
+		d.head = circ
 	end
 	return d
 end
@@ -218,15 +325,18 @@ local function hideObj(d)
 	d.box.Visible = false
 	d.tracer.Visible = false
 	d.hp.Visible = false
+	d.a1.Visible = false
+	d.a2.Visible = false
 	d.name.Visible = false
 	d.dist.Visible = false
+	if d.head then d.head.Visible = false end
 end
 
 local function removeObj(m)
 	local d = objs[m]
 	if not d then return end
 	for _, l in ipairs(d.bones) do pcall(function() l:Remove() end) end
-	for _, k in ipairs({"box", "tracer", "hp", "name", "dist"}) do
+	for _, k in ipairs({"box", "tracer", "hp", "a1", "a2", "name", "dist", "head"}) do
 		pcall(function() d[k]:Remove() end)
 	end
 	objs[m] = nil
@@ -251,6 +361,24 @@ local function setHL(m, on, col)
 	end
 end
 
+-- стрелка у края экрана для цели, которой не видно
+local function drawArrow(d, pos, col, vp)
+	local rel = cam.CFrame:PointToObjectSpace(pos)
+	local dx, dy = rel.X, rel.Z -- вперёд (-Z) = вверх по экрану
+	local len = math.sqrt(dx * dx + dy * dy)
+	if len < 1e-3 then return end
+	dx, dy = dx / len, dy / len
+	local cx, cy, r = vp.X / 2, vp.Y / 2, S.arrowRadius
+	local tx, ty = cx + dx * (r + 12), cy + dy * (r + 12)
+	local bx, by = cx + dx * r, cy + dy * r
+	local px, py = -dy * 8, dx * 8
+	d.a1.From, d.a1.To = Vector2.new(tx, ty), Vector2.new(bx + px, by + py)
+	d.a2.From, d.a2.To = Vector2.new(tx, ty), Vector2.new(bx - px, by - py)
+	d.a1.Color, d.a2.Color = col, col
+	d.a1.Thickness, d.a2.Thickness = 2, 2
+	d.a1.Visible, d.a2.Visible = true, true
+end
+
 local function drawTarget(t, col, camPos, vp)
 	local m, p = t.m, t.p
 	local hum = m:FindFirstChildOfClass("Humanoid")
@@ -263,6 +391,14 @@ local function drawTarget(t, col, camPos, vp)
 	local dist = (root.Position - camPos).Magnitude
 	if dist > S.maxDist then return false end
 	if S.team and sameTeam(m, p) then return false end
+
+	-- MM2: цвет и подпись по роли
+	local role = nil
+	if S.mm2 and p then
+		role = roleOf(p)
+		if role == "Innocent" and not S.mm2Innocents then return false end
+		col = roleCol(role)
+	end
 
 	-- без Drawing chams включаются сами, иначе ESP вообще ничего не покажет
 	if S.chams or not hasDrawing then
@@ -284,8 +420,10 @@ local function drawTarget(t, col, camPos, vp)
 	local rp, onScreen = cam:WorldToViewportPoint(root.Position)
 	if not onScreen then
 		hideObj(d)
+		if S.arrows then drawArrow(d, root.Position, col, vp) end
 		return true
 	end
+	d.a1.Visible, d.a2.Visible = false, false
 	local topP = cam:WorldToViewportPoint(head.Position + Vector3.new(0, 0.8, 0))
 	local botP = cam:WorldToViewportPoint(root.Position - Vector3.new(0, 3.2, 0))
 	local h = math.abs(botP.Y - topP.Y)
@@ -317,9 +455,23 @@ local function drawTarget(t, col, camPos, vp)
 		bx.Visible = false
 	end
 
+	local hd = d.head
+	if hd then
+		if S.headDot then
+			local hpos = cam:WorldToViewportPoint(head.Position)
+			hd.Position = Vector2.new(hpos.X, hpos.Y)
+			hd.Radius = math.max(2, h * 0.07)
+			hd.Color, hd.Thickness, hd.Visible = col, S.thick, true
+		else
+			hd.Visible = false
+		end
+	end
+
 	local tr = d.tracer
 	if S.tracers then
-		tr.From, tr.To = Vector2.new(vp.X / 2, vp.Y), Vector2.new(rp.X, botP.Y)
+		local oy = vp.Y
+		if S.tracerOrigin == 2 then oy = vp.Y / 2 elseif S.tracerOrigin == 3 then oy = 0 end
+		tr.From, tr.To = Vector2.new(vp.X / 2, oy), Vector2.new(rp.X, botP.Y)
 		tr.Color, tr.Thickness, tr.Visible = col, 1, true
 	else
 		tr.Visible = false
@@ -327,7 +479,10 @@ local function drawTarget(t, col, camPos, vp)
 
 	local nm = d.name
 	if S.name then
-		nm.Text = p and p.Name or m.Name
+		local label = p and p.Name or m.Name
+		if role then label = label .. " [" .. role .. "]" end
+		if S.healthText and hp then label = label .. " " .. math.floor(hp) .. "HP" end
+		nm.Text = label
 		nm.Position = Vector2.new(rp.X, topP.Y - 16)
 		nm.Color, nm.Visible = col, true
 	else
@@ -355,11 +510,65 @@ local function drawTarget(t, col, camPos, vp)
 	return true
 end
 
+-- MM2: подсветка выпавшего пистолета (GunDrop)
+local function dropHL(part, on)
+	local h = part:FindFirstChild("xD_drop")
+	if on and not h then
+		h = Instance.new("Highlight")
+		h.Name = "xD_drop"
+		h.FillColor = Color3.fromRGB(255, 215, 80)
+		h.OutlineColor = Color3.new(1, 1, 1)
+		h.FillTransparency = 0.4
+		h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		h.Parent = part
+	elseif not on and h then
+		h:Destroy()
+	end
+end
+
+local function dropsStep()
+	local on = S.mm2 and S.mm2Drops
+	for part in pairs(drops) do
+		local o = dropObjs[part]
+		if not part.Parent then
+			drops[part] = nil
+			if o then
+				pcall(function() o:Remove() end)
+				dropObjs[part] = nil
+			end
+		elseif on then
+			dropHL(part, true)
+			if hasDrawing then
+				if not o then
+					o = Drawing.new("Text")
+					o.Text, o.Center, o.Outline, o.Size = "Gun", true, true, 15
+					o.Color = Color3.fromRGB(255, 215, 80)
+					dropObjs[part] = o
+				end
+				local sp, vis = cam:WorldToViewportPoint(part.Position + Vector3.new(0, 1.5, 0))
+				o.Position = Vector2.new(sp.X, sp.Y)
+				o.Visible = vis
+			end
+		else
+			dropHL(part, false)
+			if o then o.Visible = false end
+		end
+	end
+end
+
+local EMPTY = {}
+local curList = EMPTY
 local espWasOn, statusT = false, 0
 local seenFrame = {}
 
+local function refreshList()
+	for k in pairs(roleCache) do roleCache[k] = nil end
+	if S.esp or S.aim or S.shoot then curList = collect() else curList = EMPTY end
+end
+
 local function espStep()
 	cam = workspace.CurrentCamera
+	dropsStep()
 	if not S.esp then
 		if espWasOn then
 			espWasOn = false
@@ -371,20 +580,22 @@ local function espStep()
 	espWasOn = true
 	local col = C(S.espColor)
 	local camPos, vp = cam.CFrame.Position, cam.ViewportSize
-	local list = collect()
+	local list = curList
 	for k in pairs(seenFrame) do seenFrame[k] = nil end
 	hlCount = 0
 
 	local shown = 0
 	for i = 1, #list do
-		local ok, res = pcall(drawTarget, list[i], col, camPos, vp)
-		if ok then
-			if res then
-				seenFrame[list[i].m] = true
-				shown = shown + 1
+		if S.nonPlayers or list[i].p then
+			local ok, res = pcall(drawTarget, list[i], col, camPos, vp)
+			if ok then
+				if res then
+					seenFrame[list[i].m] = true
+					shown = shown + 1
+				end
+			else
+				lastErr = "esp: " .. tostring(res)
 			end
-		else
-			lastErr = "esp: " .. tostring(res)
 		end
 	end
 
@@ -408,20 +619,283 @@ local function espStep()
 	end
 end
 
+---------------------------------------------------------------- аимбот и автошут
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function visibleTo(pos, m)
+	local origin = cam.CFrame.Position
+	local filter = {cam}
+	if lp.Character then filter[2] = lp.Character end
+	rayParams.FilterDescendantsInstances = filter
+	local hit = workspace:Raycast(origin, pos - origin, rayParams)
+	return hit == nil or hit.Instance:IsDescendantOf(m)
+end
+
+local nearestNames = {
+	"Head", "UpperTorso", "LowerTorso", "Torso", "HumanoidRootPart", "LeftUpperArm", "RightUpperArm",
+	"LeftUpperLeg", "RightUpperLeg", "Left Arm", "Right Arm", "Left Leg", "Right Leg",
+}
+
+local function partFor(m, mode, origin)
+	local head = m:FindFirstChild("Head")
+	local chest = m:FindFirstChild("UpperTorso") or m:FindFirstChild("Torso")
+	local root = m:FindFirstChild("HumanoidRootPart")
+	if mode == 1 then return head or chest or root end
+	if mode == 2 then return chest or root or head end
+	if mode == 3 then return root or chest or head end
+	local best, bd = nil, nil
+	for _, n in ipairs(nearestNames) do
+		local pt = m:FindFirstChild(n)
+		if pt and pt:IsA("BasePart") then
+			local sp, on = cam:WorldToViewportPoint(pt.Position)
+			if on then
+				local dd = (Vector2.new(sp.X, sp.Y) - origin).Magnitude
+				if not bd or dd < bd then best, bd = pt, dd end
+			end
+		end
+	end
+	return best or head or chest or root
+end
+
+-- упреждение: скорость цели * (пинг + время полёта снаряда)
+local function predictPos(part, dist)
+	local t = S.predictMs / 1000
+	if S.projSpeed > 0 then t = t + dist / S.projSpeed end
+	return part.Position + part.AssemblyLinearVelocity * t
+end
+
+local function candidate(t, origin, fovR, usePredict)
+	local m, p = t.m, t.p
+	if not p and not S.aimNpc then return nil end
+	local hum = m:FindFirstChildOfClass("Humanoid")
+	local hp = healthOf(m, hum)
+	if hp and hp <= 0 then return nil end
+	if S.aimTeam and sameTeam(m, p) then return nil end
+	if not mm2Allowed(p) then return nil end
+	local part = partFor(m, S.aimPart, origin)
+	if not part then return nil end
+	local dist = (part.Position - cam.CFrame.Position).Magnitude
+	if dist > S.aimMax then return nil end
+	local pos = part.Position
+	if usePredict then pos = predictPos(part, dist) end
+	local sp, on = cam:WorldToViewportPoint(pos)
+	if not on then return nil end
+	local spv = Vector2.new(sp.X, sp.Y)
+	local sd = (spv - origin).Magnitude
+	if sd > fovR then return nil end
+	if S.aimVis and not visibleTo(part.Position, m) then return nil end
+	local score = sd
+	if S.aimPrio == 2 then score = dist elseif S.aimPrio == 3 then score = hp or 100 end
+	return {m = m, p = p, part = part, pos = pos, sp = spv, dist = dist, score = score}
+end
+
+local lockM = nil
+
+local function pickTarget(origin, fovR, usePredict)
+	if S.sticky and lockM then
+		for i = 1, #curList do
+			if curList[i].m == lockM then
+				local c = candidate(curList[i], origin, fovR * 2, usePredict)
+				if c then return c end
+			end
+		end
+	end
+	local best = nil
+	for i = 1, #curList do
+		local c = candidate(curList[i], origin, fovR, usePredict)
+		if c and (not best or c.score < best.score) then best = c end
+	end
+	return best
+end
+
+local function holding(mode)
+	if mode == 1 then return true end
+	if mode == 2 then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) end
+	return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+end
+
+local aimOrigin = Vector2.new(0, 0)
+local aimInfo = {tgt = nil}
+local fovFrame, fovStroke = nil, nil
+
+local function updateFov(origin)
+	if not (S.fovShow and (S.aim or S.shoot)) then
+		if fovFrame then fovFrame.Visible = false end
+		return
+	end
+	if not fovFrame then
+		fovFrame = new("Frame", {
+			BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0, ZIndex = 4,
+		}, gui)
+		new("UICorner", {CornerRadius = UDim.new(1, 0)}, fovFrame)
+		fovStroke = stroke(fovFrame)
+	end
+	local d = S.aimFov * 2
+	fovFrame.Visible = true
+	fovFrame.Size = UDim2.fromOffset(d, d)
+	fovFrame.Position = UDim2.fromOffset(origin.X, origin.Y)
+	fovStroke.Color, fovStroke.Thickness = C(S.fovCol), S.fovThick
+end
+
+local function aimStep()
+	cam = workspace.CurrentCamera
+	refreshList()
+	local vp = cam.ViewportSize
+	local origin = Vector2.new(vp.X / 2, vp.Y / 2)
+	if S.fovFollow == 2 then origin = UIS:GetMouseLocation() end
+	aimOrigin = origin
+	updateFov(origin)
+	aimInfo.tgt = nil
+	lockM = nil
+	if S.aim and holding(S.aimHold) then
+		local t = pickTarget(origin, S.aimFov, S.predict)
+		if t then
+			aimInfo.tgt = t
+			lockM = t.m
+			local cur = cam.CFrame
+			local alpha = math.clamp(1 - S.aimSmooth / 100, 0.02, 1)
+			cam.CFrame = cur:Lerp(CFrame.lookAt(cur.Position, t.pos), alpha)
+		end
+	end
+end
+
+-- автошут: имитируем клик мыши или касание в точке, где стоит цель
+local sh = {tgt = nil, since = 0, last = 0, flashUntil = 0, flashPos = nil, shots = 0, method = "-"}
+local tracer = {line = nil, mark = nil, markStroke = nil}
+local aimT = 0
+
+local function overMenu(x, y)
+	if not (main and main.Visible) then return false end
+	local p, s = main.AbsolutePosition, main.AbsoluteSize
+	return x >= p.X and x <= p.X + s.X and y >= p.Y and y <= p.Y + s.Y
+end
+
+local function clickAt(x, y)
+	local touch = S.shootMode == 3 or (S.shootMode == 1 and UIS.TouchEnabled and not UIS.MouseEnabled)
+	if touch and VIM then
+		pcall(function() VIM:SendTouchEvent(77, 0, x, y) end)
+		task.delay(0.03, function() pcall(function() VIM:SendTouchEvent(77, 2, x, y) end) end)
+		return "touch"
+	end
+	local back = nil
+	if S.shootMove and mousemoveabs then
+		back = UIS:GetMouseLocation()
+		pcall(mousemoveabs, x, y)
+	end
+	local how = nil
+	if mouse1click then
+		pcall(mouse1click)
+		how = "mouse1click"
+	elseif VIM then
+		pcall(function() VIM:SendMouseButtonEvent(x, y, 0, true, game, 1) end)
+		task.delay(0.03, function() pcall(function() VIM:SendMouseButtonEvent(x, y, 0, false, game, 1) end) end)
+		how = "VIM mouse"
+	end
+	if back and S.shootRestore then
+		task.delay(0.05, function() pcall(mousemoveabs, back.X, back.Y) end)
+	end
+	return how
+end
+
+local function hasToolInHand()
+	local c = lp.Character
+	return c ~= nil and c:FindFirstChildOfClass("Tool") ~= nil
+end
+
+local function tracerStep(t, now, vp)
+	if not tracer.mark then
+		tracer.mark = new("Frame", {
+			Size = UDim2.fromOffset(10, 10), AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
+			BorderSizePixel = 0, ZIndex = 4, Visible = false,
+		}, gui)
+		tracer.markStroke = stroke(tracer.mark)
+	end
+	if hasDrawing and not tracer.line then
+		tracer.line = Drawing.new("Line")
+		tracer.line.Visible = false
+	end
+	local pos = nil
+	if t then pos = t.sp elseif now < sh.flashUntil then pos = sh.flashPos end
+	if not (S.tracer and pos) then
+		tracer.mark.Visible = false
+		if tracer.line then tracer.line.Visible = false end
+		return
+	end
+	local flash = now < sh.flashUntil
+	local col = flash and Color3.new(1, 1, 1) or C(S.tracerCol)
+	local sz = flash and 18 or 10
+	tracer.mark.Size = UDim2.fromOffset(sz, sz)
+	tracer.mark.Position = UDim2.fromOffset(pos.X, pos.Y)
+	tracer.mark.Visible = true
+	tracer.markStroke.Color = col
+	if tracer.line then
+		tracer.line.From, tracer.line.To = Vector2.new(vp.X / 2, vp.Y), pos
+		tracer.line.Color, tracer.line.Thickness, tracer.line.Visible = col, 1.5, true
+	end
+end
+
+local function shootStep()
+	cam = workspace.CurrentCamera
+	local now = nowMs()
+	local vp = cam.ViewportSize
+	local t = nil
+	if S.shoot and holding(S.shootHold) and (not S.shootNeedTool or hasToolInHand()) then
+		t = pickTarget(aimOrigin, S.aimFov, S.shootPredict)
+	end
+	if t then
+		if sh.tgt ~= t.m then
+			sh.tgt = t.m
+			sh.since = now
+		end
+	else
+		sh.tgt = nil
+	end
+	tracerStep(t, now, vp)
+	if t and now - sh.since >= S.shootDelay and now - sh.last >= S.shootInt and not overMenu(t.sp.X, t.sp.Y) then
+		sh.last = now
+		sh.flashUntil = now + S.tracerMs
+		sh.flashPos = t.sp
+		sh.shots = sh.shots + 1
+		sh.method = clickAt(t.sp.X, t.sp.Y) or "no click API"
+	end
+	local sec = os.clock()
+	if aimLbl and sec - aimT > 0.3 then
+		aimT = sec
+		local tg = aimInfo.tgt or t
+		aimLbl.Text = string.format("Target: %s\nShots: %d\nLast click: %s\nDevice: %s",
+			tg and (tg.p and tg.p.Name or tg.m.Name) or "-", sh.shots, sh.method,
+			(UIS.TouchEnabled and not UIS.MouseEnabled) and "touch" or "mouse")
+	end
+end
+
 ---------------------------------------------------------------- visuals: камера
-local fovSaved = nil
+local fovSaved, zoomSaved = nil, nil
 
 local function camStep()
 	cam = workspace.CurrentCamera
-	if S.fovOn then
+	local want = nil
+	if S.zoomOn and not UIS:GetFocusedTextBox() and UIS:IsKeyDown(Enum.KeyCode.C) then
+		want = S.zoomFov
+	elseif S.fovOn then
+		want = S.fov
+	end
+	if want then
 		if not fovSaved then fovSaved = cam.FieldOfView end
-		cam.FieldOfView = S.fov
+		cam.FieldOfView = want
 	elseif fovSaved then
 		cam.FieldOfView = fovSaved
 		fovSaved = nil
 	end
 	if S.stretch then
 		cam.CFrame = cam.CFrame * CFrame.new(0, 0, 0, 1, 0, 0, 0, S.stretchAmt, 0, 0, 0, 1)
+	end
+	if S.zoomLimit then
+		if zoomSaved == nil then zoomSaved = lp.CameraMaxZoomDistance end
+		lp.CameraMaxZoomDistance = S.zoomDist
+	elseif zoomSaved ~= nil then
+		lp.CameraMaxZoomDistance = zoomSaved
+		zoomSaved = nil
 	end
 end
 
@@ -442,7 +916,7 @@ local function lightRule(key, obj, prop, want)
 end
 
 local function lightStep()
-	local wBr, wSh, wAmb, wOut, wFe, wDen, wHz, wCl
+	local wBr, wSh, wAmb, wOut, wFe, wDen, wHz, wCl, wGr
 	if S.fullbright then
 		wBr, wSh = 2, false
 		wAmb = Color3.fromRGB(178, 178, 178)
@@ -454,6 +928,7 @@ local function lightStep()
 	end
 	if S.noFog then wFe, wDen, wHz = 9e9, 0, 0 end
 	if S.timeOn then wCl = S.clock end
+	if S.gravOn then wGr = S.gravity end
 	local atm = Lighting:FindFirstChildOfClass("Atmosphere")
 	lightRule("br", Lighting, "Brightness", wBr)
 	lightRule("sh", Lighting, "GlobalShadows", wSh)
@@ -463,89 +938,183 @@ local function lightStep()
 	lightRule("cl", Lighting, "ClockTime", wCl)
 	lightRule("de", atm, "Density", wDen)
 	lightRule("hz", atm, "Haze", wHz)
+	lightRule("gr", workspace, "Gravity", wGr)
 end
 
-local cc, bl = nil, nil
+local fx = {}
+
+-- эффект создаётся при включении и удаляется при выключении
+local function fxEffect(key, class, on, setup)
+	local e = fx[key]
+	if on then
+		if not e or not e.Parent then
+			e = Instance.new(class)
+			e.Name = "xD_" .. key
+			e.Parent = Lighting
+			fx[key] = e
+		end
+		setup(e)
+	elseif e then
+		e:Destroy()
+		fx[key] = nil
+	end
+end
 
 local function fxStep()
-	if S.ccOn then
-		if not cc or not cc.Parent then
-			cc = Instance.new("ColorCorrectionEffect")
-			cc.Name = "xD_cc"
-			cc.Parent = Lighting
-		end
-		cc.Saturation, cc.Contrast, cc.Brightness = S.sat, S.contrast, S.bright
-	elseif cc then
-		cc:Destroy()
-		cc = nil
-	end
-	if S.bloom then
-		if not bl or not bl.Parent then
-			bl = Instance.new("BloomEffect")
-			bl.Name = "xD_bloom"
-			bl.Size, bl.Threshold = 24, 0.8
-			bl.Parent = Lighting
-		end
-		bl.Intensity = S.bloomInt
-	elseif bl then
-		bl:Destroy()
-		bl = nil
-	end
+	fxEffect("cc", "ColorCorrectionEffect", S.ccOn, function(e)
+		e.Saturation, e.Contrast, e.Brightness = S.sat, S.contrast, S.bright
+	end)
+	fxEffect("bloom", "BloomEffect", S.bloom, function(e)
+		e.Intensity, e.Size, e.Threshold = S.bloomInt, 24, 0.8
+	end)
+	fxEffect("blur", "BlurEffect", S.blur, function(e) e.Size = S.blurSize end)
+	fxEffect("sun", "SunRaysEffect", S.sun, function(e) e.Intensity, e.Spread = S.sunInt, 0.8 end)
 end
 
--- снег: невидимая плита над камерой с ParticleEmitter (лежит в Camera, на клиенте)
-local snowPart, snowEm = nil, nil
+-- погода: невидимая плита рядом с камерой с ParticleEmitter (лежит в Camera, на клиенте)
+local wxPart, wxEm, wxMode = nil, nil, 1
+local wxOffset = {nil, 38, 40, -10}
+local wxRate = {nil, 120, 380, 60}
 
-local function snowStep()
-	if not S.snow then
-		if snowPart then
-			snowPart:Destroy()
-			snowPart, snowEm = nil, nil
-		end
+local function wxClear()
+	if wxPart then wxPart:Destroy() end
+	wxPart, wxEm = nil, nil
+end
+
+local function wxBuild(mode)
+	wxPart = Instance.new("Part")
+	wxPart.Name = "xD_weather"
+	wxPart.Anchored, wxPart.CanCollide = true, false
+	wxPart.CanTouch, wxPart.CanQuery, wxPart.CastShadow = false, false, false
+	wxPart.Transparency = 1
+	wxPart.Size = Vector3.new(110, 1, 110)
+	local e = Instance.new("ParticleEmitter")
+	e.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+	e.Rotation = NumberRange.new(0, 360)
+	e.RotSpeed = NumberRange.new(-60, 60)
+	if mode == 2 then -- снег
+		e.EmissionDirection = Enum.NormalId.Bottom
+		e.Lifetime = NumberRange.new(7, 9)
+		e.Speed = NumberRange.new(6, 10)
+		e.SpreadAngle = Vector2.new(20, 20)
+		e.Size = NumberSequence.new(0.22)
+		e.Transparency = NumberSequence.new(0.1)
+		e.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		e.LightEmission = 0.4
+	elseif mode == 3 then -- дождь
+		e.EmissionDirection = Enum.NormalId.Bottom
+		e.Lifetime = NumberRange.new(1.2, 1.6)
+		e.Speed = NumberRange.new(70, 90)
+		e.SpreadAngle = Vector2.new(3, 3)
+		e.Size = NumberSequence.new(0.3)
+		e.Transparency = NumberSequence.new(0.45)
+		e.Color = ColorSequence.new(Color3.fromRGB(170, 200, 255))
+		e.Orientation = Enum.ParticleOrientation.VelocityParallel
+		e.LightEmission = 0.1
+	else -- искры, летят вверх
+		e.EmissionDirection = Enum.NormalId.Top
+		e.Lifetime = NumberRange.new(5, 8)
+		e.Speed = NumberRange.new(3, 7)
+		e.SpreadAngle = Vector2.new(35, 35)
+		e.Size = NumberSequence.new(0.2)
+		e.Transparency = NumberSequence.new(0.1)
+		e.Color = ColorSequence.new(Color3.fromRGB(255, 140, 40))
+		e.LightEmission = 1
+	end
+	e.Parent = wxPart
+	wxEm = e
+	wxMode = mode
+end
+
+local function weatherStep()
+	local mode = S.weather
+	if mode == 1 then
+		if wxPart then wxClear() end
 		return
 	end
 	cam = workspace.CurrentCamera
-	if not snowPart or not snowPart.Parent then
-		snowPart = Instance.new("Part")
-		snowPart.Name = "xD_snow"
-		snowPart.Anchored, snowPart.CanCollide = true, false
-		snowPart.CanTouch, snowPart.CanQuery, snowPart.CastShadow = false, false, false
-		snowPart.Transparency = 1
-		snowPart.Size = Vector3.new(110, 1, 110)
-		snowEm = Instance.new("ParticleEmitter")
-		snowEm.Texture = "rbxasset://textures/particles/sparkles_main.dds"
-		snowEm.EmissionDirection = Enum.NormalId.Bottom
-		snowEm.Lifetime = NumberRange.new(7, 9)
-		snowEm.Speed = NumberRange.new(6, 10)
-		snowEm.SpreadAngle = Vector2.new(20, 20)
-		snowEm.Size = NumberSequence.new(0.22)
-		snowEm.Transparency = NumberSequence.new(0.1)
-		snowEm.Color = ColorSequence.new(Color3.new(1, 1, 1))
-		snowEm.LightEmission = 0.4
-		snowEm.Rotation = NumberRange.new(0, 360)
-		snowEm.RotSpeed = NumberRange.new(-60, 60)
-		snowEm.Parent = snowPart
+	if wxMode ~= mode or not wxPart or not wxPart.Parent then
+		wxClear()
+		wxBuild(mode)
 	end
-	if snowPart.Parent ~= cam then snowPart.Parent = cam end
-	snowPart.CFrame = CFrame.new(cam.CFrame.Position + Vector3.new(0, 38, 0))
-	snowEm.Rate = 120 * S.snowAmt
-	snowEm.Acceleration = Vector3.new(S.snowWind, 0, S.snowWind * 0.4)
+	if wxPart.Parent ~= cam then wxPart.Parent = cam end
+	wxPart.CFrame = CFrame.new(cam.CFrame.Position + Vector3.new(0, wxOffset[mode], 0))
+	wxEm.Rate = wxRate[mode] * S.wxAmt
+	local w = S.wxWind
+	if mode == 3 then w = w * 2 end
+	wxEm.Acceleration = Vector3.new(w, mode == 4 and 2 or 0, w * 0.4)
 end
 
-local sLight, sFx, sSnow = safe("light", lightStep), safe("fx", fxStep), safe("snow", snowStep)
+-- прицел (Frame-ы, поэтому работает без Drawing)
+local crossFrame = nil
+
+local function updateCross()
+	if crossFrame then
+		crossFrame:Destroy()
+		crossFrame = nil
+	end
+	if not S.cross then return end
+	crossFrame = new("Frame", {Size = UDim2.fromOffset(0, 0), Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1}, gui)
+	local col, g, l, t = C(S.crossColor), S.crossGap, S.crossSize, S.crossThick
+	local ht = math.floor(t / 2)
+	local function bar(x, y, w, h)
+		new("Frame", {
+			Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, h), BackgroundColor3 = col, BorderSizePixel = 0,
+		}, crossFrame)
+	end
+	bar(-ht, -g - l, t, l) -- верх
+	bar(-ht, g, t, l)      -- низ
+	bar(-g - l, -ht, l, t) -- лево
+	bar(g, -ht, l, t)      -- право
+	if S.crossDot then bar(-ht, -ht, t, t) end
+end
+
+-- MM2: кто убийца и шериф (подпись сверху экрана)
+local hudT = 0
+
+local function hudStep()
+	local on = S.mm2 and S.mm2Hud
+	if not hudLbl then return end
+	hudLbl.Visible = on
+	local now = os.clock()
+	if not on or now - hudT < 0.5 then return end
+	hudT = now
+	for k in pairs(roleCache) do roleCache[k] = nil end
+	local murd, sher = "-", "-"
+	for _, p in ipairs(Players:GetPlayers()) do
+		local r = roleOf(p)
+		if r == "Murderer" then murd = p.Name elseif r == "Sheriff" then sher = p.Name end
+	end
+	hudLbl.Text = "Murderer: " .. murd .. "   |   Sheriff: " .. sher
+end
+
+local sLight, sFx, sWx, sHud = safe("light", lightStep), safe("fx", fxStep), safe("weather", weatherStep), safe("hud", hudStep)
 
 local function worldStep()
 	sLight()
 	sFx()
-	sSnow()
+	sWx()
+	sHud()
+	if crossFrame and S.crossSpin then crossFrame.Rotation = (os.clock() * S.crossSpinSpeed) % 360 end
+	if toastLbl and toastUntil > 0 and os.clock() > toastUntil then
+		toastLbl.Text = ""
+		toastUntil = 0
+	end
 end
 
 ---------------------------------------------------------------- universal + antishki (движение)
 local mv = {
 	char = nil, boosted = false, base = 16, fixedOn = false, preFixed = 16,
-	ar = nil, neck = nil, neckC0 = nil, jit = 1, jit2 = 1,
+	ar = nil, neck = nil, neckC0 = nil, jit = 1, jit2 = 1, camOffSaved = nil,
 }
 local uniT = 0
+
+bind(UIS.JumpRequest, function()
+	if not S.infJump then return end
+	local c = lp.Character
+	local h = c and c:FindFirstChildOfClass("Humanoid")
+	if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+end)
 
 local function speedStep(hum)
 	-- fRtmmx: постоянная скорость, в том числе после респавна
@@ -601,7 +1170,7 @@ local function yawStep(hum, root)
 	elseif S.yawMode == 3 then -- Jitter (спиной к камере, качаем влево-вправо)
 		mv.jit = -mv.jit
 		root.CFrame = CFrame.new(pos) * CFrame.Angles(0, camYaw + math.pi + math.rad(S.jitAngle) * mv.jit, 0)
-	else -- Backwards
+	else -- Back
 		root.CFrame = CFrame.new(pos) * CFrame.Angles(0, camYaw + math.pi, 0)
 	end
 end
@@ -632,6 +1201,16 @@ local function pitchStep(c)
 	neck.C0 = CFrame.new(base.Position) * CFrame.Angles(ang, 0, 0) * (base - base.Position)
 end
 
+local function camOffStep(hum)
+	if S.camOff then
+		if mv.camOffSaved == nil then mv.camOffSaved = hum.CameraOffset end
+		hum.CameraOffset = Vector3.new(S.offX, S.offY, S.offZ)
+	elseif mv.camOffSaved ~= nil then
+		hum.CameraOffset = mv.camOffSaved
+		mv.camOffSaved = nil
+	end
+end
+
 local function restoreMove()
 	local c = lp.Character
 	local hum = c and c:FindFirstChildOfClass("Humanoid")
@@ -639,6 +1218,7 @@ local function restoreMove()
 		if mv.boosted then hum.WalkSpeed = mv.base end
 		if mv.fixedOn then hum.WalkSpeed = mv.preFixed end
 		if mv.ar ~= nil then hum.AutoRotate = mv.ar end
+		if mv.camOffSaved ~= nil then hum.CameraOffset = mv.camOffSaved end
 	end
 	if mv.neck and mv.neckC0 and mv.neck.Parent then mv.neck.C0 = mv.neckC0 end
 end
@@ -648,7 +1228,7 @@ local function moveStep()
 	local c = lp.Character
 	if c ~= mv.char then
 		mv.char = c
-		mv.boosted, mv.fixedOn, mv.ar, mv.neck, mv.neckC0 = false, false, nil, nil, nil
+		mv.boosted, mv.fixedOn, mv.ar, mv.neck, mv.neckC0, mv.camOffSaved = false, false, nil, nil, nil, nil
 	end
 	local hum = c and c:FindFirstChildOfClass("Humanoid")
 	local root = c and c:FindFirstChild("HumanoidRootPart")
@@ -656,6 +1236,7 @@ local function moveStep()
 	speedStep(hum)
 	yawStep(hum, root)
 	pitchStep(c)
+	camOffStep(hum)
 	local now = os.clock()
 	if uniLbl and now - uniT > 0.3 then
 		uniT = now
@@ -663,20 +1244,7 @@ local function moveStep()
 	end
 end
 
----------------------------------------------------------------- UI: помощники
-local function new(class, props, parent)
-	local o = Instance.new(class)
-	for k, v in pairs(props) do o[k] = v end
-	o.Parent = parent
-	return o
-end
-
-local function stroke(o, col)
-	return new("UIStroke", {
-		Color = col or LINE, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-	}, o)
-end
-
+---------------------------------------------------------------- UI: ввод, виджеты
 local ord = 0
 local function nxt() ord = ord + 1 return ord end
 
@@ -708,11 +1276,11 @@ local function makeDraggable(handle, target)
 	return function() return moved end
 end
 
-local gui = Instance.new("ScreenGui")
-gui.Name, gui.ResetOnSpawn, gui.IgnoreGuiInset = "xDpwr", false, true
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
-if not gui.Parent then gui.Parent = lp:WaitForChild("PlayerGui") end
+-- все виджеты регистрируют функцию обновления, чтобы вкладки всегда показывали актуальные значения
+local refreshers = {}
+local function refreshAll()
+	for _, fn in ipairs(refreshers) do fn() end
+end
 
 ---------------------------------------------------------------- лого: перевёрнутый треугольник с ушками
 -- треугольники собираются из горизонтальных полосок, поэтому ассеты не нужны
@@ -747,9 +1315,10 @@ local function makeLogo(parent, s, x, y)
 end
 
 ---------------------------------------------------------------- главное окно (только прямые углы)
-local WIN_W, WIN_H, SIDE_W = 640, 420, 150
+local WIN_W, WIN_H, SIDE_W = 700, 460, 150
+local PAGE_X, PAGE_Y, COLW = SIDE_W + 10, 82, 256
 
-local main = new("Frame", {
+main = new("Frame", {
 	Size = UDim2.fromOffset(WIN_W, WIN_H), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
 	BackgroundColor3 = BG, BackgroundTransparency = S.winAlpha, BorderSizePixel = 0, ZIndex = 5,
 }, gui)
@@ -770,42 +1339,75 @@ new("TextLabel", {
 }, side)
 new("TextLabel", {
 	Position = UDim2.fromOffset(66, 42), Size = UDim2.fromOffset(80, 14), BackgroundTransparency = 1,
-	Text = "v2", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = DIM, TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "v3", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = DIM, TextXAlignment = Enum.TextXAlignment.Left,
+}, side)
+toastLbl = new("TextLabel", {
+	Position = UDim2.new(0, 10, 1, -48), Size = UDim2.fromOffset(134, 20), BackgroundTransparency = 1,
+	Text = "", Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = TXT, TextXAlignment = Enum.TextXAlignment.Left,
+	TextWrapped = true,
 }, side)
 new("TextLabel", {
-	Position = UDim2.new(0, 14, 1, -24), Size = UDim2.fromOffset(130, 14), BackgroundTransparency = 1,
+	Position = UDim2.new(0, 10, 1, -24), Size = UDim2.fromOffset(134, 14), BackgroundTransparency = 1,
 	Text = "RightShift - hide", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = DIM, TextXAlignment = Enum.TextXAlignment.Left,
 }, side)
 
 local title = new("TextLabel", {
 	Position = UDim2.fromOffset(SIDE_W + 14, 10), Size = UDim2.fromOffset(300, 24), BackgroundTransparency = 1,
-	Text = "ESP", Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = TXT, TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "", Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = TXT, TextXAlignment = Enum.TextXAlignment.Left,
 }, main)
 new("Frame", {
 	Size = UDim2.new(1, -SIDE_W, 0, 1), Position = UDim2.fromOffset(SIDE_W, 40), BackgroundColor3 = LINE, BorderSizePixel = 0,
 }, main)
 
----------------------------------------------------------------- вкладки и элементы
-local tabs, tabCount = {}, 0
-local togRefs = {}
+-- HUD ролей MM2 (верх экрана)
+hudLbl = new("TextLabel", {
+	Size = UDim2.fromOffset(420, 22), AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 8),
+	BackgroundColor3 = BG, BackgroundTransparency = 0.25, BorderSizePixel = 0, Text = "", Font = Enum.Font.GothamMedium,
+	TextSize = 13, TextColor3 = TXT, Visible = false, ZIndex = 3,
+}, gui)
+stroke(hudLbl)
 
-local function selectTab(name)
+---------------------------------------------------------------- вкладки: группы слева, подстраницы сверху
+local tabs, activeTab = {}, nil
+local togRefs = {}
+local sideY = 78
+
+local function showTab(name)
 	for n, t in pairs(tabs) do
 		local on = n == name
-		t.page.Visible = on
 		t.btn.BackgroundTransparency = on and 0 or 1
 		t.lbl.TextColor3 = on and TXT or DIM
 		t.bar.Visible = on
+		for sn, s in pairs(t.subs) do
+			local cur = on and sn == t.cur
+			s.btn.Visible = on
+			s.page.Visible = cur
+			s.ul.Visible = cur
+			s.btn.TextColor3 = cur and TXT or DIM
+			s.btn.BackgroundColor3 = cur and EL2 or EL
+		end
 	end
 	title.Text = name
+	activeTab = name
+	refreshAll()
 end
 
-local function addTab(name)
-	tabCount = tabCount + 1
+local function group(text)
+	sideY = sideY + 4
+	new("TextLabel", {
+		Position = UDim2.fromOffset(14, sideY), Size = UDim2.fromOffset(124, 14), BackgroundTransparency = 1,
+		Text = text, Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = DIM, TextXAlignment = Enum.TextXAlignment.Left,
+	}, side)
+	sideY = sideY + 16
+end
+
+-- addTab("Visuals", {"Camera", "World"}) возвращает функцию: page("World") -> левая, правая колонка
+local function addTab(name, subs)
 	local btn = new("TextButton", {
-		Size = UDim2.new(1, -20, 0, 30), Position = UDim2.fromOffset(10, 78 + (tabCount - 1) * 34),
+		Size = UDim2.new(1, -20, 0, 30), Position = UDim2.fromOffset(10, sideY),
 		BackgroundColor3 = EL, BackgroundTransparency = 1, BorderSizePixel = 0, Text = "", AutoButtonColor = false,
 	}, side)
+	sideY = sideY + 32
 	local lbl = new("TextLabel", {
 		Position = UDim2.fromOffset(14, 0), Size = UDim2.new(1, -14, 1, 0), BackgroundTransparency = 1, Text = name,
 		Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = DIM, TextXAlignment = Enum.TextXAlignment.Left,
@@ -813,22 +1415,45 @@ local function addTab(name)
 	local bar = new("Frame", {Size = UDim2.new(0, 2, 1, 0), BorderSizePixel = 0, Visible = false}, btn)
 	onAccent(function() bar.BackgroundColor3 = A() end)
 
-	local page = new("Frame", {
-		Size = UDim2.fromOffset(WIN_W - SIDE_W - 20, WIN_H - 60), Position = UDim2.fromOffset(SIDE_W + 10, 50),
-		BackgroundTransparency = 1, Visible = false,
-	}, main)
-	local function column(x)
-		local c = new("ScrollingFrame", {
-			Size = UDim2.fromOffset(230, WIN_H - 60), Position = UDim2.fromOffset(x, 0), BackgroundTransparency = 1,
-			BorderSizePixel = 0, ScrollBarThickness = 2, ScrollBarImageColor3 = LINE,
-			CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-		}, page)
-		new("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, c)
-		return c
+	local tab = {btn = btn, lbl = lbl, bar = bar, subs = {}, cur = subs[1]}
+	tabs[name] = tab
+	btn.MouseButton1Click:Connect(function() showTab(name) end)
+
+	local x = 0
+	for _, sn in ipairs(subs) do
+		local w = #sn * 8 + 26
+		local sb = new("TextButton", {
+			Size = UDim2.fromOffset(w, 26), Position = UDim2.fromOffset(SIDE_W + 10 + x, 46), BackgroundColor3 = EL,
+			BorderSizePixel = 0, Text = sn, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = DIM,
+			AutoButtonColor = false, Visible = false,
+		}, main)
+		stroke(sb)
+		local ul = new("Frame", {Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2), BorderSizePixel = 0, Visible = false}, sb)
+		onAccent(function() ul.BackgroundColor3 = A() end)
+		local page = new("Frame", {
+			Size = UDim2.fromOffset(COLW * 2 + 10, WIN_H - PAGE_Y - 10), Position = UDim2.fromOffset(PAGE_X, PAGE_Y),
+			BackgroundTransparency = 1, Visible = false,
+		}, main)
+		local function column(cx)
+			local c = new("ScrollingFrame", {
+				Size = UDim2.fromOffset(COLW, WIN_H - PAGE_Y - 10), Position = UDim2.fromOffset(cx, 0), BackgroundTransparency = 1,
+				BorderSizePixel = 0, ScrollBarThickness = 2, ScrollBarImageColor3 = LINE,
+				CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			}, page)
+			new("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, c)
+			return c
+		end
+		tab.subs[sn] = {btn = sb, ul = ul, page = page, L = column(0), R = column(COLW + 10)}
+		sb.MouseButton1Click:Connect(function()
+			tab.cur = sn
+			showTab(name)
+		end)
+		x = x + w + 4
 	end
-	tabs[name] = {btn = btn, lbl = lbl, bar = bar, page = page}
-	btn.MouseButton1Click:Connect(function() selectTab(name) end)
-	return column(0), column(240)
+	return function(sn)
+		local s = tab.subs[sn]
+		return s.L, s.R
+	end
 end
 
 local function section(col, text)
@@ -852,7 +1477,7 @@ end
 
 local function setToggle(key, v)
 	S[key] = v
-	if togRefs[key] then togRefs[key]() end
+	for _, fn in ipairs(togRefs[key] or {}) do fn() end
 end
 
 local function toggle(parent, text, key, cb)
@@ -876,7 +1501,9 @@ local function toggle(parent, text, key, cb)
 		refresh()
 		if cb then cb(S[key]) end
 	end)
-	togRefs[key] = refresh
+	togRefs[key] = togRefs[key] or {}
+	table.insert(togRefs[key], refresh)
+	refreshers[#refreshers + 1] = refresh
 	onAccent(refresh)
 end
 
@@ -924,6 +1551,7 @@ local function slider(parent, text, min, max, step, get, set, fmt)
 			dragFn = function(pos) setFrom(pos.X) end
 		end
 	end)
+	refreshers[#refreshers + 1] = refresh
 	refresh()
 end
 
@@ -946,6 +1574,7 @@ local function selector(parent, text, opts, get, set)
 		set(i)
 		b.Text = opts[i]
 	end)
+	refreshers[#refreshers + 1] = function() b.Text = opts[get()] end
 end
 
 local function button(parent, text, cb)
@@ -976,6 +1605,7 @@ local function colorPicker(parent, text, t, cb)
 		BackgroundColor3 = C(t), BorderSizePixel = 0,
 	}, head)
 	stroke(sw)
+	refreshers[#refreshers + 1] = function() sw.BackgroundColor3 = C(t) end
 	for i, n in ipairs({"R", "G", "B"}) do
 		slider(parent, n, 0, 255, 1, function() return t[i] end, function(v)
 			t[i] = v
@@ -985,141 +1615,337 @@ local function colorPicker(parent, text, t, cb)
 	end
 end
 
----------------------------------------------------------------- прицел (Visuals)
-local crossFrame = nil
+---------------------------------------------------------------- конфиг и темы
+local CFG = "xDpwr.json"
 
-local function updateCross()
-	if crossFrame then
-		crossFrame:Destroy()
-		crossFrame = nil
-	end
-	if not S.cross then return end
-	crossFrame = new("Frame", {Size = UDim2.fromOffset(0, 0), Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1}, gui)
-	local col, g, l, t = C(S.crossColor), S.crossGap, S.crossSize, S.crossThick
-	local ht = math.floor(t / 2)
-	local function bar(x, y, w, h)
-		new("Frame", {
-			Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, h), BackgroundColor3 = col, BorderSizePixel = 0,
-		}, crossFrame)
-	end
-	bar(-ht, -g - l, t, l) -- верх
-	bar(-ht, g, t, l)      -- низ
-	bar(-g - l, -ht, l, t) -- лево
-	bar(g, -ht, l, t)      -- право
-	if S.crossDot then bar(-ht, -ht, t, t) end
+local function cfgSave()
+	local ok = pcall(function() writefile(CFG, HttpService:JSONEncode(S)) end)
+	toast(ok and "Config saved" or "Save failed (no writefile)")
+end
+
+local function cfgLoad()
+	local ok = pcall(function()
+		local d = HttpService:JSONDecode(readfile(CFG))
+		for k, v in pairs(d) do
+			local cur = S[k]
+			if type(cur) == "table" and type(v) == "table" then
+				for i = 1, #cur do
+					if type(v[i]) == "number" then cur[i] = v[i] end
+				end
+			elseif cur ~= nil and type(cur) == type(v) then
+				S[k] = v
+			end
+		end
+	end)
+	refreshAll()
+	applyAccent()
+	updateCross()
+	toast(ok and "Config loaded" or "Load failed (no file)")
+end
+
+local themes = {
+	{"Default", {110, 90, 255}},
+	{"Murder Drones", {225, 55, 70}},
+	{"Sally Face", {70, 130, 235}},
+	{"Toxic", {90, 230, 120}},
+	{"Sakura", {255, 130, 190}},
+	{"Gold", {240, 190, 60}},
+}
+local themeNames = {}
+for i, t in ipairs(themes) do themeNames[i] = t[1] end
+
+local function applyTheme(i)
+	S.theme = i
+	local c = themes[i][2]
+	S.accent[1], S.accent[2], S.accent[3] = c[1], c[2], c[3]
+	applyAccent()
+	refreshAll()
+	toast("Theme: " .. themes[i][1])
+end
+
+-- пресет настроек одним нажатием
+local function preset(tbl, name)
+	for k, v in pairs(tbl) do S[k] = v end
+	refreshAll()
+	updateCross()
+	toast(name .. " applied")
 end
 
 ---------------------------------------------------------------- содержимое вкладок
+local holdOpts = {"Always", "RMB", "LMB"}
+
+group("COMBAT")
+
+do -- Aimbot
+	local pg = addTab("Aimbot", {"Aim", "Autoshoot", "Target", "FOV"})
+
+	local L, R = pg("Aim")
+	local s = section(L, "Aimbot (camera)")
+	toggle(s, "Enabled", "aim")
+	selector(s, "Hold", holdOpts, function() return S.aimHold end, function(v) S.aimHold = v end)
+	selector(s, "Aim part", {"Head", "Chest", "Root", "Nearest"}, function() return S.aimPart end, function(v) S.aimPart = v end)
+	slider(s, "Smoothness", 0, 100, 1, function() return S.aimSmooth end, function(v) S.aimSmooth = v end)
+	toggle(s, "Sticky target", "sticky")
+	local p = section(R, "Prediction")
+	toggle(p, "Prediction", "predict")
+	slider(p, "Predict (ms)", 0, 300, 5, function() return S.predictMs end, function(v) S.predictMs = v end)
+	slider(p, "Projectile speed (0 = off)", 0, 1000, 10, function() return S.projSpeed end, function(v) S.projSpeed = v end)
+	local i = section(R, "Info")
+	info(i, "Aimbot turns the camera to the target. Smoothness 0 = instant snap, higher = slower and softer.")
+
+	L, R = pg("Autoshoot")
+	local a = section(L, "Autoshoot")
+	toggle(a, "Enabled", "shoot")
+	selector(a, "Hold", holdOpts, function() return S.shootHold end, function(v) S.shootHold = v end)
+	slider(a, "Delay before shot (ms)", 0, 1000, 10, function() return S.shootDelay end, function(v) S.shootDelay = v end)
+	slider(a, "Shot interval (ms)", 30, 2000, 10, function() return S.shootInt end, function(v) S.shootInt = v end)
+	toggle(a, "Need tool in hand", "shootNeedTool")
+	local pr = section(L, "Predict shoot")
+	toggle(pr, "Predict shoot", "shootPredict")
+	slider(pr, "Predict (ms)", 0, 300, 5, function() return S.predictMs end, function(v) S.predictMs = v end)
+	slider(pr, "Projectile speed (0 = off)", 0, 1000, 10, function() return S.projSpeed end, function(v) S.projSpeed = v end)
+	local c = section(R, "Click")
+	selector(c, "Click as", {"Auto", "Mouse", "Touch"}, function() return S.shootMode end, function(v) S.shootMode = v end)
+	toggle(c, "Move cursor to target", "shootMove")
+	toggle(c, "Restore cursor", "shootRestore")
+	local tr = section(R, "Shot tracer")
+	toggle(tr, "Show tracer", "tracer")
+	slider(tr, "Flash time (ms)", 50, 1000, 10, function() return S.tracerMs end, function(v) S.tracerMs = v end)
+	colorPicker(tr, "Color", S.tracerCol)
+	local st = section(R, "Status")
+	aimLbl = info(st, "-")
+
+	L, R = pg("Target")
+	local t = section(L, "Target selection")
+	selector(t, "Priority", {"Crosshair", "Distance", "Health"}, function() return S.aimPrio end, function(v) S.aimPrio = v end)
+	toggle(t, "Team check", "aimTeam")
+	toggle(t, "Visible check", "aimVis")
+	toggle(t, "Include non-players", "aimNpc")
+	slider(t, "Max distance", 100, 5000, 50, function() return S.aimMax end, function(v) S.aimMax = v end)
+	local n = section(R, "Info")
+	info(n, "Autoshoot clicks on the target's screen position, so the camera can point anywhere. It works best in games where the shot goes to the cursor. Where the shot follows the camera, turn on Aimbot too.")
+
+	L, R = pg("FOV")
+	local f = section(L, "FOV circle")
+	toggle(f, "Show circle", "fovShow")
+	slider(f, "Radius", 10, 600, 5, function() return S.aimFov end, function(v) S.aimFov = v end)
+	selector(f, "Follow", {"Center", "Cursor"}, function() return S.fovFollow end, function(v) S.fovFollow = v end)
+	slider(f, "Thickness", 1, 4, 1, function() return S.fovThick end, function(v) S.fovThick = v end)
+	local fc = section(R, "Circle color")
+	colorPicker(fc, "Color", S.fovCol)
+end
+
+do -- MM2
+	local pg = addTab("MM2", {"Main", "Roles", "Presets"})
+
+	local L, R = pg("Main")
+	local s = section(L, "Murder Mystery 2")
+	toggle(s, "MM2 mode", "mm2")
+	toggle(s, "Role HUD", "mm2Hud")
+	toggle(s, "Gun drop ESP", "mm2Drops")
+	toggle(s, "Show innocents", "mm2Innocents")
+	info(s, game.PlaceId == MM2_PLACE and "Detected: Murder Mystery 2" or "Not in MM2 (mode still works)")
+	local a = section(R, "Aim targets")
+	selector(a, "Target", {"Auto", "Murderer", "Sheriff", "Everyone"}, function() return S.mm2Aim end, function(v) S.mm2Aim = v end)
+	info(a, "Auto: as murderer you target everyone, otherwise only the murderer. Roles come from Knife / Gun in the Backpack or hand. ESP shows roles when MM2 mode is on.")
+
+	L, R = pg("Roles")
+	local m = section(L, "Murderer color")
+	colorPicker(m, "Color", S.cMurd)
+	local sh2 = section(L, "Sheriff color")
+	colorPicker(sh2, "Color", S.cSher)
+	local inn = section(R, "Innocent color")
+	colorPicker(inn, "Color", S.cInno)
+
+	L, R = pg("Presets")
+	local p = section(L, "Quick setup")
+	button(p, "Sheriff preset", function()
+		preset({
+			mm2 = true, mm2Aim = 2, shoot = true, shootNeedTool = true, shootDelay = 40, shootInt = 700,
+			shootPredict = true, predictMs = 80, projSpeed = 0, aimPart = 2, aimVis = true,
+		}, "Sheriff preset")
+	end)
+	button(p, "Murderer preset", function()
+		preset({
+			mm2 = true, mm2Aim = 1, shoot = true, shootNeedTool = true, shootDelay = 30, shootInt = 900,
+			shootPredict = true, predictMs = 60, projSpeed = 110, aimPart = 2, aimVis = true,
+		}, "Murderer preset")
+	end)
+	local i = section(R, "Info")
+	info(i, "Presets set Autoshoot for each role. Murderer projectile speed (110) is a starting guess, tune it on the Autoshoot page.")
+end
+
+group("VISUALS")
+
 do -- ESP
-	local L, R = addTab("ESP")
-	local s = section(L, "Main")
+	local pg = addTab("ESP", {"Main", "Filters", "Colors", "Status"})
+
+	local L, R = pg("Main")
+	local s = section(L, "Boxes and lines")
 	toggle(s, "Enabled", "esp")
 	toggle(s, "Skeleton", "skeleton")
 	toggle(s, "Box", "box")
-	toggle(s, "Name", "name")
-	toggle(s, "Distance", "dist")
-	toggle(s, "Health bar", "health")
+	toggle(s, "Head dot", "headDot")
 	toggle(s, "Tracers", "tracers")
-	toggle(s, "Chams (Highlight)", "chams")
+	selector(s, "Tracer from", {"Bottom", "Center", "Top"}, function() return S.tracerOrigin end, function(v) S.tracerOrigin = v end)
+	local t = section(R, "Text")
+	toggle(t, "Name", "name")
+	toggle(t, "Distance", "dist")
+	toggle(t, "Health bar", "health")
+	toggle(t, "Health text", "healthText")
+	local c = section(R, "Extras")
+	toggle(c, "Chams (Highlight)", "chams")
+	slider(c, "Chams fill", 0, 1, 0.05, function() return S.chamsFill end, function(v) S.chamsFill = v end)
+	toggle(c, "Off-screen arrows", "arrows")
+	slider(c, "Arrow radius", 60, 400, 10, function() return S.arrowRadius end, function(v) S.arrowRadius = v end)
 
-	local f = section(R, "Filters")
+	L, R = pg("Filters")
+	local f = section(L, "Filters")
 	toggle(f, "Team check", "team")
 	toggle(f, "Non-player models", "nonPlayers")
 	slider(f, "Max distance", 100, 5000, 50, function() return S.maxDist end, function(v) S.maxDist = v end)
 	slider(f, "Line thickness", 1, 4, 0.5, function() return S.thick end, function(v) S.thick = v end)
-	slider(f, "Chams fill", 0, 1, 0.05, function() return S.chamsFill end, function(v) S.chamsFill = v end)
 
-	local c = section(R, "ESP color")
-	colorPicker(c, "Color", S.espColor)
+	L, R = pg("Colors")
+	local cc = section(L, "ESP color")
+	colorPicker(cc, "Color", S.espColor)
+	local n = section(R, "Info")
+	info(n, "With MM2 mode on, colors come from the MM2 > Roles page.")
 
+	L, R = pg("Status")
 	local st = section(L, "Status")
 	statusLbl = info(st, "waiting for ESP...")
 end
 
 do -- Visuals
-	local L, R = addTab("Visuals")
-	local s = section(L, "Camera")
+	local pg = addTab("Visuals", {"Camera", "World", "Effects", "Crosshair"})
+
+	local L, R = pg("Camera")
+	local s = section(L, "Field of view")
 	toggle(s, "Custom FOV", "fovOn")
 	slider(s, "FOV (max 120)", 30, 120, 1, function() return S.fov end, function(v) S.fov = v end)
+	toggle(s, "Zoom (hold C)", "zoomOn")
+	slider(s, "Zoom FOV", 5, 70, 1, function() return S.zoomFov end, function(v) S.zoomFov = v end)
 	toggle(s, "Stretch screen", "stretch")
 	slider(s, "Stretch (lower = wider)", 0.4, 1, 0.01, function() return S.stretchAmt end, function(v) S.stretchAmt = v end)
+	local o = section(R, "Camera position")
+	toggle(o, "Camera offset", "camOff")
+	slider(o, "Offset X", -6, 6, 0.25, function() return S.offX end, function(v) S.offX = v end)
+	slider(o, "Offset Y", -6, 6, 0.25, function() return S.offY end, function(v) S.offY = v end)
+	slider(o, "Offset Z", -6, 6, 0.25, function() return S.offZ end, function(v) S.offZ = v end)
+	toggle(o, "Far zoom-out", "zoomLimit")
+	slider(o, "Max distance", 20, 2000, 10, function() return S.zoomDist end, function(v) S.zoomDist = v end)
 
-	local x = section(L, "Crosshair")
-	toggle(x, "Enabled", "cross", updateCross)
-	toggle(x, "Center dot", "crossDot", updateCross)
-	slider(x, "Size", 2, 30, 1, function() return S.crossSize end, function(v) S.crossSize = v updateCross() end)
-	slider(x, "Gap", 0, 20, 1, function() return S.crossGap end, function(v) S.crossGap = v updateCross() end)
-	slider(x, "Thickness", 1, 6, 1, function() return S.crossThick end, function(v) S.crossThick = v updateCross() end)
-	colorPicker(x, "Color", S.crossColor, updateCross)
-
-	local w = section(R, "World")
+	L, R = pg("World")
+	local w = section(L, "Lighting")
 	toggle(w, "Fullbright", "fullbright")
 	toggle(w, "No fog", "noFog")
 	toggle(w, "Custom time", "timeOn")
 	slider(w, "Clock time", 0, 24, 0.25, function() return S.clock end, function(v) S.clock = v end)
 	toggle(w, "World tint", "tintOn")
 	colorPicker(w, "Tint", S.tint)
+	local wx = section(R, "Weather")
+	selector(wx, "Mode", {"Off", "Snow", "Rain", "Embers"}, function() return S.weather end, function(v) S.weather = v end)
+	slider(wx, "Amount", 0.2, 3, 0.1, function() return S.wxAmt end, function(v) S.wxAmt = v end)
+	slider(wx, "Wind", -10, 10, 0.5, function() return S.wxWind end, function(v) S.wxWind = v end)
 
-	local e = section(R, "Effects")
-	toggle(e, "Color correction", "ccOn")
+	L, R = pg("Effects")
+	local e = section(L, "Color correction")
+	toggle(e, "Enabled", "ccOn")
 	slider(e, "Saturation", -1, 1, 0.05, function() return S.sat end, function(v) S.sat = v end)
 	slider(e, "Contrast", -1, 1, 0.05, function() return S.contrast end, function(v) S.contrast = v end)
 	slider(e, "Brightness", -0.3, 0.3, 0.02, function() return S.bright end, function(v) S.bright = v end)
-	toggle(e, "Bloom", "bloom")
-	slider(e, "Bloom intensity", 0, 2, 0.05, function() return S.bloomInt end, function(v) S.bloomInt = v end)
+	local b = section(R, "Bloom and blur")
+	toggle(b, "Bloom", "bloom")
+	slider(b, "Bloom intensity", 0, 2, 0.05, function() return S.bloomInt end, function(v) S.bloomInt = v end)
+	toggle(b, "Blur", "blur")
+	slider(b, "Blur size", 0, 40, 1, function() return S.blurSize end, function(v) S.blurSize = v end)
+	toggle(b, "Sun rays", "sun")
+	slider(b, "Sun intensity", 0, 1, 0.05, function() return S.sunInt end, function(v) S.sunInt = v end)
 
-	local sn = section(R, "Snow")
-	toggle(sn, "Snow", "snow")
-	slider(sn, "Amount", 0.2, 3, 0.1, function() return S.snowAmt end, function(v) S.snowAmt = v end)
-	slider(sn, "Wind", -10, 10, 0.5, function() return S.snowWind end, function(v) S.snowWind = v end)
+	L, R = pg("Crosshair")
+	local x = section(L, "Crosshair")
+	toggle(x, "Enabled", "cross", updateCross)
+	toggle(x, "Center dot", "crossDot", updateCross)
+	slider(x, "Size", 2, 30, 1, function() return S.crossSize end, function(v) S.crossSize = v updateCross() end)
+	slider(x, "Gap", 0, 20, 1, function() return S.crossGap end, function(v) S.crossGap = v updateCross() end)
+	slider(x, "Thickness", 1, 6, 1, function() return S.crossThick end, function(v) S.crossThick = v updateCross() end)
+	local y = section(R, "Style")
+	colorPicker(y, "Color", S.crossColor, updateCross)
+	toggle(y, "Spinning", "crossSpin")
+	slider(y, "Spin speed", 10, 360, 10, function() return S.crossSpinSpeed end, function(v) S.crossSpinSpeed = v end)
 end
 
+group("MISC")
+
 do -- Universal
-	local L, R = addTab("Universal")
-	local s = section(L, "Movement")
+	local pg = addTab("Universal", {"Movement", "Info"})
+
+	local L, R = pg("Movement")
+	local s = section(L, "Speed")
 	toggle(s, "Bhop", "bhop", function(on) if on then setToggle("bhopStrafe", false) end end)
 	slider(s, "Bhop air speed", 16, 60, 1, function() return S.bhopSpeed end, function(v) S.bhopSpeed = v end)
 	toggle(s, "Bhop + Strafe", "bhopStrafe", function(on) if on then setToggle("bhop", false) end end)
 	slider(s, "Strafe air speed", 16, 80, 1, function() return S.strafeSpeed end, function(v) S.strafeSpeed = v end)
 	toggle(s, "fRtmmx (fixed speed)", "fixed")
 	slider(s, "fRtmmx speed", 8, 80, 1, function() return S.fixedSpeed end, function(v) S.fixedSpeed = v end)
+	local m = section(R, "Jump and gravity")
+	toggle(m, "Infinite jump", "infJump")
+	toggle(m, "Custom gravity", "gravOn")
+	slider(m, "Gravity", 0, 300, 5, function() return S.gravity end, function(v) S.gravity = v end)
 
-	local i = section(R, "Info")
+	L, R = pg("Info")
+	local i = section(L, "How it works")
 	info(i, "Bhop: speed rises only while you are in the air (jump yourself, hold Space). Walking speed stays as in the game.\n\nBhop + Strafe: same, but with its own, higher air speed.\n\nfRtmmx: constant speed on the ground and in the air, also after respawn.")
 	local d = section(R, "Live")
 	uniLbl = info(d, "-")
 end
 
 do -- Antishki
-	local L, R = addTab("Antishki")
+	local pg = addTab("Antishki", {"Yaw", "Pitch"})
+
+	local L, R = pg("Yaw")
 	local y = section(L, "Yaw")
 	selector(y, "Mode", {"Off", "Spin", "Jitter", "Back"}, function() return S.yawMode end, function(v) S.yawMode = v end)
 	slider(y, "Spin speed", 1, 90, 1, function() return S.spinSpeed end, function(v) S.spinSpeed = v end)
 	slider(y, "Jitter angle", 10, 180, 5, function() return S.jitAngle end, function(v) S.jitAngle = v end)
+	local n = section(R, "Note")
+	info(n, "Test features. Spin / Jitter / Back turn your character. What other players see depends on the game.")
 
-	local p = section(R, "Pitch")
+	L, R = pg("Pitch")
+	local p = section(L, "Pitch")
 	selector(p, "Mode", {"Off", "Down", "Up", "Jitter"}, function() return S.pitchMode end, function(v) S.pitchMode = v end)
 	slider(p, "Angle", 0, 90, 1, function() return S.pitchAngle end, function(v) S.pitchAngle = v end)
-
-	local n = section(R, "Note")
-	info(n, "Test features. Spin / Jitter / Back turn your character, Pitch tilts the head. What other players see depends on the game.")
 end
 
+group("SETTINGS")
+
+local unload = nil
+
 do -- Menu
-	local L, R = addTab("Menu")
+	local pg = addTab("Menu", {"Look", "Config"})
+
+	local L, R = pg("Look")
 	local s = section(L, "Accent color")
 	colorPicker(s, "Color", S.accent, applyAccent)
-
-	local w = section(R, "Window")
-	slider(w, "Transparency", 0, 0.5, 0.05, function() return S.winAlpha end, function(v)
+	local th = section(R, "Theme")
+	selector(th, "Preset", themeNames, function() return S.theme end, function(v) applyTheme(v) end)
+	slider(th, "Window transparency", 0, 0.5, 0.05, function() return S.winAlpha end, function(v)
 		S.winAlpha = v
 		main.BackgroundTransparency = v
 		side.BackgroundTransparency = v
 	end)
-	button(w, "Unload script", function() if getgenv and getgenv().xDpwr then getgenv().xDpwr() end end)
+
+	L, R = pg("Config")
+	local c = section(L, "Config file")
+	button(c, "Save config", cfgSave)
+	button(c, "Load config", cfgLoad)
+	info(c, "Saved as xDpwr.json in the executor workspace folder.")
+	local u = section(R, "Script")
+	button(u, "Unload script", function() if unload then unload() end end)
 end
 
-selectTab("ESP")
+showTab("Aimbot")
 
 ---------------------------------------------------------------- перетаскивание, кнопка скрытия, хоткей
 local topbar = new("Frame", {Size = UDim2.new(1, -40, 0, 40), BackgroundTransparency = 1, Active = true}, main)
@@ -1148,26 +1974,34 @@ bind(UIS.InputBegan, function(i, gp)
 end)
 
 ---------------------------------------------------------------- запуск шагов
-RS:BindToRenderStep("xDpwr_cam", Enum.RenderPriority.Camera.Value + 1, safe("cam", camStep))
-RS:BindToRenderStep("xDpwr_esp", Enum.RenderPriority.Camera.Value + 2, safe("esp", espStep))
+local P = Enum.RenderPriority.Camera.Value
+RS:BindToRenderStep("xDpwr_aim", P + 1, safe("aim", aimStep))
+RS:BindToRenderStep("xDpwr_cam", P + 2, safe("cam", camStep))
+RS:BindToRenderStep("xDpwr_shoot", P + 3, safe("shoot", shootStep))
+RS:BindToRenderStep("xDpwr_esp", P + 4, safe("esp", espStep))
 RS:BindToRenderStep("xDpwr_move", Enum.RenderPriority.Character.Value + 1, safe("move", moveStep))
 bind(RS.Heartbeat, worldStep)
 
 ---------------------------------------------------------------- выгрузка
-local function unload()
+unload = function()
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
-	pcall(function() RS:UnbindFromRenderStep("xDpwr_cam") end)
-	pcall(function() RS:UnbindFromRenderStep("xDpwr_esp") end)
-	pcall(function() RS:UnbindFromRenderStep("xDpwr_move") end)
+	for _, n in ipairs({"aim", "cam", "shoot", "esp", "move"}) do
+		pcall(function() RS:UnbindFromRenderStep("xDpwr_" .. n) end)
+	end
 	pcall(restoreMove)
 	for m in pairs(objs) do removeObj(m) end
 	for m in pairs(hlSet) do pcall(setHL, m, false) end
+	for part, o in pairs(dropObjs) do pcall(function() o:Remove() end) end
+	for part in pairs(drops) do pcall(dropHL, part, false) end
+	if tracer.line then pcall(function() tracer.line:Remove() end) end
 	if fovSaved then pcall(function() workspace.CurrentCamera.FieldOfView = fovSaved end) end
-	-- вернуть освещение: выключаем все правила
-	S.fullbright, S.noFog, S.timeOn, S.tintOn, S.ccOn, S.bloom, S.snow = false, false, false, false, false, false, false
+	if zoomSaved then pcall(function() lp.CameraMaxZoomDistance = zoomSaved end) end
+	-- вернуть освещение и убрать эффекты: выключаем все правила
+	S.fullbright, S.noFog, S.timeOn, S.tintOn, S.gravOn = false, false, false, false, false
+	S.ccOn, S.bloom, S.blur, S.sun, S.weather = false, false, false, false, 1
 	pcall(lightStep)
 	pcall(fxStep)
-	pcall(snowStep)
+	pcall(weatherStep)
 	if getgenv then getgenv().xDpwr = nil end
 	gui:Destroy()
 end
