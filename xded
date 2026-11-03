@@ -1,4 +1,4 @@
--- xDpwr v3 | Aimbot, MM2, ESP, Visuals, Universal, Antishki
+-- xDpwr v4 | Aimbot, GmCh (MM2 / Prison Life), ESP, Visuals, Universal, Antishki
 -- RightShift или кнопка с лого: скрыть / показать меню
 
 local Players = game:GetService("Players")
@@ -8,8 +8,9 @@ local Lighting = game:GetService("Lighting")
 local HttpService = game:GetService("HttpService")
 local lp = Players.LocalPlayer
 local cam = workspace.CurrentCamera
-local VIM = nil
+local VIM, VU = nil, nil
 pcall(function() VIM = game:GetService("VirtualInputManager") end)
+pcall(function() VU = game:GetService("VirtualUser") end)
 
 -- если скрипт запущен повторно, убираем старую копию
 if getgenv and getgenv().xDpwr then pcall(getgenv().xDpwr) end
@@ -23,11 +24,16 @@ local S = {
 	aimFov = 150, fovShow = true, fovFollow = 1, fovCol = {255, 255, 255}, fovThick = 1,
 	-- autoshoot
 	shoot = false, shootHold = 1, shootDelay = 60, shootInt = 150, shootPredict = false,
-	shootMode = 1, shootMove = true, shootRestore = true, shootNeedTool = false,
+	shootMode = 1, shootMove = false, shootRestore = true, shootNeedTool = false,
 	tracer = true, tracerMs = 250, tracerCol = {255, 80, 80},
 	-- mm2
 	mm2 = false, mm2Aim = 1, mm2Innocents = true, mm2Hud = true, mm2Drops = true,
 	cMurd = {255, 60, 60}, cSher = {60, 140, 255}, cInno = {80, 230, 120},
+	-- gmch: игры
+	gmAuto = true,
+	pl = false, plAim = 1, plHud = true, plColors = true, plGuards = true, plInmates = true, plCriminals = true,
+	-- радар
+	radar = false, radarSize = 160, radarRange = 250, radarCorner = 1, radarRotate = true,
 	-- esp
 	esp = false, skeleton = true, box = false, name = true, dist = true, health = true,
 	healthText = false, headDot = false, tracers = false, tracerOrigin = 1,
@@ -56,7 +62,7 @@ local S = {
 	yawMode = 1, spinSpeed = 25, jitAngle = 60,
 	pitchMode = 1, pitchAngle = 80,
 	-- меню
-	accent = {110, 90, 255}, theme = 1, winAlpha = 0,
+	accent = {110, 90, 255}, theme = 1, winAlpha = 0, vibeFade = 1.4,
 }
 
 local function C(t) return Color3.fromRGB(t[1], t[2], t[3]) end
@@ -96,6 +102,7 @@ local function nowMs() return os.clock() * 1000 end
 -- заполняются при создании меню
 local statusLbl, uniLbl, aimLbl, hudLbl, toastLbl = nil, nil, nil, nil, nil
 local main = nil
+local refreshAll = nil -- задаётся при создании виджетов
 local toastUntil = 0
 
 local function toast(text)
@@ -285,6 +292,43 @@ local function mm2Allowed(p)
 	return role == "Murderer"
 end
 
+-- Prison Life: команды Guards / Inmates / Criminals
+local PL_PLACE = 155615604
+local PL_COLORS = {Guards = {60, 140, 255}, Inmates = {255, 150, 40}, Criminals = {255, 60, 60}}
+
+local function plTeamName(p)
+	local t = p and p.Team
+	return t and t.Name or "Neutral"
+end
+
+local function plColor(n)
+	local c = PL_COLORS[n]
+	return c and C(c) or Color3.fromRGB(230, 230, 235)
+end
+
+-- кого можно выбирать целью в режиме Prison Life
+local function plAllowed(p)
+	if not S.pl or not p then return true end
+	local tn, mine, m = plTeamName(p), plTeamName(lp), S.plAim
+	if m == 5 then return true end
+	if m == 2 then return tn == "Guards" end
+	if m == 3 then return tn == "Inmates" end
+	if m == 4 then return tn == "Criminals" end
+	-- Auto: охрана целится в преступников, остальные в охрану
+	if mine == "Guards" then return tn == "Criminals" end
+	if mine == "Inmates" or mine == "Criminals" then return tn == "Guards" end
+	return true
+end
+
+-- по PlaceId или по набору команд определяем, в какой мы игре
+local function detectGame()
+	if game.PlaceId == MM2_PLACE then return "mm2" end
+	if game.PlaceId == PL_PLACE then return "pl" end
+	local ok, Teams = pcall(function() return game:GetService("Teams") end)
+	if ok and Teams and Teams:FindFirstChild("Guards") and Teams:FindFirstChild("Inmates") then return "pl" end
+	return nil
+end
+
 ---------------------------------------------------------------- ESP: объекты рисования
 local objs, hlSet, dropObjs = {}, {}, {}
 local hlCount = 0
@@ -398,6 +442,18 @@ local function drawTarget(t, col, camPos, vp)
 		role = roleOf(p)
 		if role == "Innocent" and not S.mm2Innocents then return false end
 		col = roleCol(role)
+	end
+	-- Prison Life: цвет и подпись по команде, скрытые команды не рисуем
+	if S.pl and p then
+		local tn = plTeamName(p)
+		if (tn == "Guards" and not S.plGuards) or (tn == "Inmates" and not S.plInmates)
+			or (tn == "Criminals" and not S.plCriminals) then
+			return false
+		end
+		if PL_COLORS[tn] then
+			role = tn
+			if S.plColors then col = plColor(tn) end
+		end
 	end
 
 	-- без Drawing chams включаются сами, иначе ESP вообще ничего не покажет
@@ -561,14 +617,82 @@ local curList = EMPTY
 local espWasOn, statusT = false, 0
 local seenFrame = {}
 
+-- радар: квадрат в углу экрана, вперёд = вверх (на Frame-ах, работает без Drawing)
+local radar = {frame = nil, me = nil, dots = {}}
+local radarCorners = {
+	{Vector2.new(1, 0), UDim2.new(1, -12, 0, 12)},
+	{Vector2.new(0, 0), UDim2.new(0, 12, 0, 12)},
+	{Vector2.new(1, 1), UDim2.new(1, -12, 1, -12)},
+	{Vector2.new(0, 1), UDim2.new(0, 12, 1, -12)},
+}
+
+local function dotColor(p)
+	if p then
+		if S.mm2 then return roleCol(roleOf(p)) end
+		if S.pl and S.plColors then return plColor(plTeamName(p)) end
+	end
+	return C(S.espColor)
+end
+
+local function radarStep()
+	if not S.radar then
+		if radar.frame then radar.frame.Visible = false end
+		return
+	end
+	if not radar.frame then
+		local f = new("Frame", {
+			BackgroundColor3 = BG, BackgroundTransparency = 0.25, BorderSizePixel = 0, ZIndex = 3, ClipsDescendants = true,
+		}, gui)
+		stroke(f)
+		new("Frame", {Size = UDim2.new(1, 0, 0, 1), Position = UDim2.fromScale(0, 0.5), BackgroundColor3 = LINE, BorderSizePixel = 0}, f)
+		new("Frame", {Size = UDim2.new(0, 1, 1, 0), Position = UDim2.fromScale(0.5, 0), BackgroundColor3 = LINE, BorderSizePixel = 0}, f)
+		radar.me = new("Frame", {
+			Size = UDim2.fromOffset(6, 6), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), BorderSizePixel = 0,
+		}, f)
+		onAccent(function() radar.me.BackgroundColor3 = A() end)
+		radar.frame = f
+	end
+	local f, size = radar.frame, S.radarSize
+	local c = radarCorners[S.radarCorner]
+	f.Visible = true
+	f.AnchorPoint, f.Position, f.Size = c[1], c[2], UDim2.fromOffset(size, size)
+	local look = cam.CFrame.LookVector
+	local yaw = S.radarRotate and math.atan2(-look.X, -look.Z) or 0
+	local cs, sn = math.cos(yaw), math.sin(yaw)
+	local myPos = cam.CFrame.Position
+	local half, used = size / 2, 0
+	local scale = half / S.radarRange
+	for i = 1, #curList do
+		local t = curList[i]
+		local root = t.m:FindFirstChild("HumanoidRootPart") or t.m.PrimaryPart
+		local hum = t.m:FindFirstChildOfClass("Humanoid")
+		if root and (t.p or S.nonPlayers) and not (hum and hum.Health <= 0) then
+			local rel = root.Position - myPos
+			local right = rel.X * cs - rel.Z * sn
+			local up = -rel.X * sn - rel.Z * cs
+			used = used + 1
+			local dot = radar.dots[used]
+			if not dot then
+				dot = new("Frame", {Size = UDim2.fromOffset(5, 5), AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0}, f)
+				radar.dots[used] = dot
+			end
+			dot.Position = UDim2.fromOffset(math.clamp(half + right * scale, 3, size - 3), math.clamp(half - up * scale, 3, size - 3))
+			dot.BackgroundColor3 = dotColor(t.p)
+			dot.Visible = true
+		end
+	end
+	for i = used + 1, #radar.dots do radar.dots[i].Visible = false end
+end
+
 local function refreshList()
 	for k in pairs(roleCache) do roleCache[k] = nil end
-	if S.esp or S.aim or S.shoot then curList = collect() else curList = EMPTY end
+	if S.esp or S.aim or S.shoot or S.radar then curList = collect() else curList = EMPTY end
 end
 
 local function espStep()
 	cam = workspace.CurrentCamera
 	dropsStep()
+	radarStep()
 	if not S.esp then
 		if espWasOn then
 			espWasOn = false
@@ -672,7 +796,7 @@ local function candidate(t, origin, fovR, usePredict)
 	local hp = healthOf(m, hum)
 	if hp and hp <= 0 then return nil end
 	if S.aimTeam and sameTeam(m, p) then return nil end
-	if not mm2Allowed(p) then return nil end
+	if not (mm2Allowed(p) and plAllowed(p)) then return nil end
 	local part = partFor(m, S.aimPart, origin)
 	if not part then return nil end
 	local dist = (part.Position - cam.CFrame.Position).Magnitude
@@ -1278,7 +1402,7 @@ end
 
 -- все виджеты регистрируют функцию обновления, чтобы вкладки всегда показывали актуальные значения
 local refreshers = {}
-local function refreshAll()
+refreshAll = function()
 	for _, fn in ipairs(refreshers) do fn() end
 end
 
